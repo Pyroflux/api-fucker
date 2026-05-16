@@ -53,6 +53,17 @@ type importKeysRequest struct {
 	Enabled        bool   `json:"enabled"`
 }
 
+type bulkConcurrencyRequest struct {
+	IDs            []string `json:"ids"`
+	All            bool     `json:"all"`
+	MaxConcurrency int      `json:"maxConcurrency"`
+}
+
+type bulkDeleteRequest struct {
+	IDs []string `json:"ids"`
+	All bool     `json:"all"`
+}
+
 type keyListResponse struct {
 	Items      []store.KeyView `json:"items"`
 	Total      int             `json:"total"`
@@ -107,6 +118,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.keys(w, r)
 	case r.URL.Path == "/api/admin/keys/import":
 		h.importKeys(w, r)
+	case r.URL.Path == "/api/admin/keys/concurrency":
+		h.bulkUpdateConcurrency(w, r)
+	case r.URL.Path == "/api/admin/keys/delete":
+		h.bulkDeleteKeys(w, r)
 	case r.URL.Path == "/api/admin/keys/restore-all":
 		h.restoreAllKeys(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/admin/keys/"):
@@ -114,6 +129,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+func (h *Handler) bulkUpdateConcurrency(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req bulkConcurrencyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	ids, ok := bulkTargetIDs(req.IDs, req.All)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no keys selected"})
+		return
+	}
+	result, err := h.store.UpdateKeysMaxConcurrency(ids, req.MaxConcurrency)
+	respond(w, result, err)
+}
+
+func (h *Handler) bulkDeleteKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req bulkDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	ids, ok := bulkTargetIDs(req.IDs, req.All)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no keys selected"})
+		return
+	}
+	result, err := h.store.DeleteKeys(ids)
+	respond(w, result, err)
+}
+
+func bulkTargetIDs(ids []string, all bool) ([]string, bool) {
+	if all {
+		return nil, true
+	}
+	cleaned := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			cleaned = append(cleaned, id)
+		}
+	}
+	return cleaned, len(cleaned) > 0
 }
 
 func (h *Handler) restoreAllKeys(w http.ResponseWriter, r *http.Request) {

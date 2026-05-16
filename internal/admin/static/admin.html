@@ -237,6 +237,7 @@
       font-weight: 600;
     }
     .toolbar select { width: auto; min-width: 92px; }
+    .toolbar input { width: 88px; min-width: 88px; }
 
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 1120px; }
@@ -485,6 +486,15 @@
             </label>
             <button class="secondary" type="button" onclick="openImportDialog()">批量导入</button>
             <button class="secondary" type="button" onclick="restoreAllKeys()">全部恢复</button>
+            <label>范围
+              <select id="bulkScope">
+                <option value="selected">选中</option>
+                <option value="all">全部</option>
+              </select>
+            </label>
+            <label>并发<input id="bulkMaxConcurrency" type="number" min="1" value="1"></label>
+            <button class="secondary" type="button" onclick="bulkUpdateConcurrency()">批量调并发</button>
+            <button class="danger" type="button" onclick="bulkDeleteKeys()">批量删除</button>
             <button type="button" onclick="openKeyDialog()">新增 Key</button>
           </div>
         </div>
@@ -492,6 +502,7 @@
           <table>
             <thead>
               <tr>
+                <th><input id="selectPageKeys" type="checkbox" onchange="togglePageSelection(this.checked)" aria-label="选择当前页"></th>
                 <th>名称</th>
                 <th>Key</th>
                 <th>中转站覆盖</th>
@@ -644,6 +655,7 @@
     let sortBy = "default";
     let sortOrder = "desc";
     let testingId = "";
+    const selectedKeyIds = new Set();
 
     const el = id => document.getElementById(id);
     const value = id => el(id).value.trim();
@@ -903,10 +915,61 @@
       }
     }
 
+    function bulkTargetPayload() {
+      const all = value("bulkScope") === "all";
+      const ids = all ? [] : Array.from(selectedKeyIds);
+      if (!all && ids.length === 0) {
+        toast("请先选择 Key，或将范围切换为全部", "error");
+        return null;
+      }
+      return { all, ids };
+    }
+
+    async function bulkUpdateConcurrency() {
+      const target = bulkTargetPayload();
+      if (!target) return;
+      const maxConcurrency = Number(value("bulkMaxConcurrency") || "0");
+      if (!Number.isFinite(maxConcurrency) || maxConcurrency <= 0) {
+        toast("并发必须大于 0", "error");
+        return;
+      }
+      const label = target.all ? "全部 Key" : `选中的 ${target.ids.length} 个 Key`;
+      if (!confirm(`确认把${label}的最大并发调整为 ${maxConcurrency}？`)) return;
+      try {
+        const result = await api("/api/admin/keys/concurrency", {
+          method: "POST",
+          body: JSON.stringify({ ...target, maxConcurrency })
+        });
+        await loadAll(false);
+        toast(`已调整 ${result.updated || 0} 个 Key`);
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function bulkDeleteKeys() {
+      const target = bulkTargetPayload();
+      if (!target) return;
+      const label = target.all ? "全部 Key" : `选中的 ${target.ids.length} 个 Key`;
+      if (!confirm(`确认删除${label}？这个操作不可恢复。`)) return;
+      try {
+        const result = await api("/api/admin/keys/delete", {
+          method: "POST",
+          body: JSON.stringify(target)
+        });
+        selectedKeyIds.clear();
+        await loadAll(false);
+        toast(`已删除 ${result.deleted || 0} 个 Key`);
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
     async function deleteKey(id) {
       if (!confirm("确认删除这个 Key？")) return;
       try {
         await api(`/api/admin/keys/${id}`, { method: "DELETE" });
+        selectedKeyIds.delete(id);
         await loadAll(false);
         toast("已删除");
       } catch (e) {
@@ -1133,6 +1196,7 @@
       el("nextPageButton").disabled = totalPages === 0 || page >= totalPages;
       el("keysTable").innerHTML = keys.map(k => `
         <tr>
+          <td><input type="checkbox" ${selectedKeyIds.has(k.id) ? "checked" : ""} onchange="toggleKeySelection('${k.id}', this.checked)" aria-label="选择 ${escapeHtml(k.name)}"></td>
           <td><strong>${escapeHtml(k.name)}</strong></td>
           <td class="mono">${maskKey(k.apiKey)}</td>
           <td class="truncate">${escapeHtml(k.baseUrl || "使用全局")}</td>
@@ -1152,6 +1216,30 @@
           </td>
         </tr>
       `).join("");
+      updatePageSelectionState();
+    }
+
+    function toggleKeySelection(id, checked) {
+      if (checked) selectedKeyIds.add(id);
+      else selectedKeyIds.delete(id);
+      updatePageSelectionState();
+    }
+
+    function togglePageSelection(checked) {
+      keys.forEach(k => {
+        if (checked) selectedKeyIds.add(k.id);
+        else selectedKeyIds.delete(k.id);
+      });
+      render();
+    }
+
+    function updatePageSelectionState() {
+      const checkbox = el("selectPageKeys");
+      if (!checkbox) return;
+      const visible = keys.map(k => k.id);
+      const selected = visible.filter(id => selectedKeyIds.has(id)).length;
+      checkbox.checked = visible.length > 0 && selected === visible.length;
+      checkbox.indeterminate = selected > 0 && selected < visible.length;
     }
 
     function statusPill(k) {

@@ -130,6 +130,80 @@ func TestConfigSavesIPRules(t *testing.T) {
 	}
 }
 
+func TestBulkConcurrencyAndDeleteActions(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+
+	a, err := h.store.CreateKey(store.Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.store.CreateKey(store.Key{Name: "b", APIKey: "secret-b", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := h.store.CreateKey(store.Key{Name: "c", APIKey: "secret-c", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/keys/concurrency", strings.NewReader(`{"ids":["`+a.ID+`","`+b.ID+`"],"maxConcurrency":7}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"updated":2`) {
+		t.Fatalf("bulk concurrency status = %d body = %s", res.Code, res.Body.String())
+	}
+	updatedA, _ := h.store.GetKey(a.ID)
+	updatedB, _ := h.store.GetKey(b.ID)
+	updatedC, _ := h.store.GetKey(c.ID)
+	if updatedA.MaxConcurrency != 7 || updatedB.MaxConcurrency != 7 || updatedC.MaxConcurrency != 1 {
+		t.Fatalf("unexpected concurrency: %+v %+v %+v", updatedA, updatedB, updatedC)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/admin/keys/concurrency", strings.NewReader(`{"all":true,"maxConcurrency":3}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token")
+	res = httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"updated":3`) {
+		t.Fatalf("bulk concurrency all status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/admin/keys/delete", strings.NewReader(`{"ids":["`+a.ID+`"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token")
+	res = httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"deleted":1`) {
+		t.Fatalf("bulk delete status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/admin/keys/delete", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token")
+	res = httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"deleted":2`) {
+		t.Fatalf("bulk delete all status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestBulkActionsRequireSelectionUnlessAll(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/keys/delete", strings.NewReader(`{"ids":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "no keys selected") {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestKeyModelsAndTestActions(t *testing.T) {
 	h, closeStore := newTestHandler(t, "token")
 	defer closeStore()

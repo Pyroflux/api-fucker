@@ -73,6 +73,14 @@ type ImportResult struct {
 	Errors   []string `json:"errors"`
 }
 
+type BulkUpdateResult struct {
+	Updated int `json:"updated"`
+}
+
+type BulkDeleteResult struct {
+	Deleted int `json:"deleted"`
+}
+
 type Capture struct {
 	KeyID          string                `json:"keyId"`
 	Time           time.Time             `json:"time"`
@@ -274,6 +282,97 @@ func (s *Store) UpdateKey(id string, patch Key) (Key, error) {
 		return b.Put([]byte(id), next)
 	})
 	return updated, err
+}
+
+func (s *Store) UpdateKeysMaxConcurrency(ids []string, maxConcurrency int) (BulkUpdateResult, error) {
+	if maxConcurrency <= 0 {
+		return BulkUpdateResult{}, fmt.Errorf("max concurrency must be greater than zero")
+	}
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			wanted[id] = true
+		}
+	}
+	updateAll := len(wanted) == 0
+	result := BulkUpdateResult{}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(keysBucket))
+		type keyUpdate struct {
+			id  []byte
+			key Key
+		}
+		updates := make([]keyUpdate, 0)
+		if err := b.ForEach(func(k, v []byte) error {
+			id := string(k)
+			if !updateAll && !wanted[id] {
+				return nil
+			}
+			var key Key
+			if err := json.Unmarshal(v, &key); err != nil {
+				return err
+			}
+			key.MaxConcurrency = maxConcurrency
+			key.UpdatedAt = time.Now().UTC()
+			if err := ValidateKey(key); err != nil {
+				return err
+			}
+			updates = append(updates, keyUpdate{id: append([]byte(nil), k...), key: key})
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			raw, err := json.Marshal(update.key)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(update.id, raw); err != nil {
+				return err
+			}
+			result.Updated++
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) DeleteKeys(ids []string) (BulkDeleteResult, error) {
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			wanted[id] = true
+		}
+	}
+	deleteAll := len(wanted) == 0
+	result := BulkDeleteResult{}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		keys := tx.Bucket([]byte(keysBucket))
+		captures := tx.Bucket([]byte(captureBucket))
+		toDelete := make([][]byte, 0)
+		if err := keys.ForEach(func(k, _ []byte) error {
+			id := string(k)
+			if deleteAll || wanted[id] {
+				toDelete = append(toDelete, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, id := range toDelete {
+			if err := keys.Delete(id); err != nil {
+				return err
+			}
+			if err := captures.Delete(id); err != nil {
+				return err
+			}
+			result.Deleted++
+		}
+		return nil
+	})
+	return result, err
 }
 
 func (s *Store) ImportKeys(inputs []ImportKeyInput) (ImportResult, error) {

@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestCreateRestoreAndCapture(t *testing.T) {
 	st, err := Open(t.TempDir() + "/data.db")
@@ -143,5 +146,77 @@ func TestRestoreAllKeys(t *testing.T) {
 		if key.Paused || key.BalanceDepleted || key.ConsecutiveErrors != 0 || key.LastError != "" {
 			t.Fatalf("expected restored key, got %+v", key)
 		}
+	}
+}
+
+func TestBulkUpdateConcurrencyAndDeleteKeys(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first, err := st.CreateKey(Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateKey(Key{Name: "b", APIKey: "secret-b", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := st.CreateKey(Key{Name: "c", APIKey: "secret-c", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := st.UpdateKeysMaxConcurrency([]string{first.ID, second.ID}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Updated != 2 {
+		t.Fatalf("updated = %d, want 2", updated.Updated)
+	}
+	first, _ = st.GetKey(first.ID)
+	second, _ = st.GetKey(second.ID)
+	third, _ = st.GetKey(third.ID)
+	if first.MaxConcurrency != 5 || second.MaxConcurrency != 5 || third.MaxConcurrency != 1 {
+		t.Fatalf("unexpected concurrency: %+v %+v %+v", first, second, third)
+	}
+
+	updated, err = st.UpdateKeysMaxConcurrency(nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Updated != 3 {
+		t.Fatalf("updated all = %d, want 3", updated.Updated)
+	}
+
+	if err := st.SaveCapture(Capture{KeyID: first.ID, RequestBody: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := st.DeleteKeys([]string{first.ID, "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted.Deleted)
+	}
+	if _, err := st.GetCapture(first.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected capture deletion, got %v", err)
+	}
+
+	deleted, err = st.DeleteKeys(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Deleted != 2 {
+		t.Fatalf("deleted all = %d, want 2", deleted.Deleted)
+	}
+	keys, err := st.ListKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("keys left = %d, want 0", len(keys))
 	}
 }
