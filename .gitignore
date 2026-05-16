@@ -1,0 +1,7 @@
+data.db
+*.db
+*.db-*
+bin/
+dist/
+.DS_Store
+.idea/

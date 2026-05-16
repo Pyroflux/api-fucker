@@ -1,0 +1,1183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nvidia Fucker</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --line: #d9e0ea;
+      --line-strong: #c5cedb;
+      --text: #172033;
+      --muted: #667085;
+      --muted-strong: #475467;
+      --primary: #0f766e;
+      --primary-strong: #0b5f59;
+      --danger: #b42318;
+      --warning: #b54708;
+      --ok-bg: #dff7ef;
+      --bad-bg: #fee4e2;
+      --warn-bg: #fff2cc;
+      --shadow: 0 14px 36px rgba(16, 24, 40, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, textarea, select { font: inherit; }
+    button {
+      height: 36px;
+      border: 1px solid var(--primary);
+      background: var(--primary);
+      color: #fff;
+      border-radius: 6px;
+      padding: 0 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover { background: var(--primary-strong); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    button.secondary { background: #fff; color: var(--primary); }
+    button.secondary:hover { background: #edf8f6; }
+    button.ghost { border-color: transparent; background: transparent; color: var(--muted-strong); }
+    button.ghost:hover { background: #edf1f6; }
+    button.danger { border-color: var(--danger); background: var(--danger); }
+    input, textarea, select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 8px 10px;
+      outline: none;
+    }
+    input:focus, textarea:focus, select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(15, 118, 110, .12);
+    }
+    textarea {
+      min-height: 132px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      line-height: 1.5;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted-strong);
+      font-weight: 600;
+      min-width: 0;
+    }
+    .hidden { display: none !important; }
+
+    .login-screen {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      background: var(--surface);
+    }
+    .login-brand {
+      padding: 56px 64px;
+      background: #eef3f7;
+      display: grid;
+      place-items: center;
+      border-right: 1px solid var(--line);
+    }
+    .login-brand h1 {
+      margin: 0;
+      font-size: clamp(52px, 6vw, 96px);
+      line-height: 1;
+      font-weight: 900;
+      letter-spacing: -0.06em;
+      color: var(--text);
+    }
+    .login-card {
+      padding: 56px 40px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 18px;
+    }
+    .login-card h2 { margin: 0; font-size: 22px; }
+    .login-card form { display: grid; gap: 14px; }
+
+    .shell { min-height: 100vh; display: grid; grid-template-rows: 58px 1fr; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      background: var(--primary);
+      color: #fff;
+      font-weight: 800;
+    }
+    .brand h1 { margin: 0; font-size: 17px; }
+    .top-actions { display: flex; align-items: center; gap: 10px; }
+
+    .page {
+      padding: 18px 24px 28px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      max-width: 1680px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .metric {
+      min-height: 116px;
+      padding: 18px 18px 16px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-rows: auto 1fr auto;
+      gap: 6px 14px;
+      align-items: start;
+      border-radius: 12px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, .92), rgba(255, 255, 255, .98)),
+        linear-gradient(135deg, var(--metric-tint), #fff);
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 22px rgba(16, 24, 40, .045);
+      text-align: left;
+    }
+    .metric::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 5px;
+      height: 100%;
+      border-radius: 12px 0 0 12px;
+      background: var(--metric-accent);
+      box-shadow: none;
+    }
+    .metric.total { --metric-accent: #2563eb; --metric-tint: #eff6ff; }
+    .metric.healthy { --metric-accent: var(--primary); --metric-tint: #ecfdf5; }
+    .metric.paused { --metric-accent: var(--warning); --metric-tint: #fff7ed; }
+    .metric.inflight { --metric-accent: #7c3aed; --metric-tint: #f5f3ff; }
+    .metric span {
+      color: var(--muted-strong);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .02em;
+    }
+    .metric strong {
+      grid-column: 1;
+      align-self: center;
+      color: var(--text);
+      font-size: 38px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    .metric small {
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: end;
+      color: var(--metric-accent);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .panel-header {
+      min-height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-header h2 { margin: 0; font-size: 15px; }
+    .panel-body { padding: 16px; }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .toolbar label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .toolbar select { width: auto; min-width: 92px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 1120px; }
+    th, td {
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .muted { color: var(--muted); }
+    .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 12px;
+      background: var(--ok-bg);
+      color: var(--primary-strong);
+    }
+    .pill.bad { background: var(--bad-bg); color: var(--danger); }
+    .pill.warn { background: var(--warn-bg); color: var(--warning); }
+    .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+    .empty {
+      height: 180px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+    }
+    .pager {
+      min-height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 16px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .pager-actions { display: flex; align-items: center; gap: 8px; }
+
+    dialog {
+      width: min(760px, calc(100vw - 32px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0;
+      box-shadow: var(--shadow);
+    }
+    dialog::backdrop { background: rgba(15, 23, 42, .36); }
+    .dialog-head {
+      height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .dialog-head h2 { margin: 0; font-size: 15px; }
+    .dialog-body { padding: 16px; display: grid; gap: 14px; }
+    .dialog-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--line);
+      background: var(--surface-soft);
+    }
+    .modal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .span-2 { grid-column: span 2; }
+    pre {
+      margin: 0;
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f172a;
+      color: #dbeafe;
+      padding: 12px;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .capture-grid { display: grid; gap: 14px; }
+    .progress-list {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      padding: 10px;
+    }
+    .progress-item {
+      display: grid;
+      grid-template-columns: 86px 1fr;
+      gap: 8px;
+      align-items: start;
+      color: var(--muted-strong);
+      font-size: 13px;
+    }
+    .progress-item strong {
+      color: var(--primary);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .progress-item.bad strong { color: var(--danger); }
+    .progress-item small { color: var(--danger); }
+    .progress-list.timeline .progress-item {
+      grid-template-columns: 72px 86px 1fr;
+    }
+    .progress-time {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .progress-empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .capture-section { display: grid; gap: 8px; }
+    .capture-section h3 {
+      margin: 0;
+      color: var(--muted-strong);
+      font-size: 13px;
+    }
+    .capture-meta {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .capture-field {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      padding: 9px 10px;
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .capture-field span { color: var(--muted); font-size: 12px; }
+    .capture-field strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      max-width: min(460px, calc(100vw - 40px));
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 11px 13px;
+      box-shadow: var(--shadow);
+      z-index: 10;
+    }
+    .toast.error { border-color: #fda29b; color: var(--danger); }
+
+    @media (max-width: 900px) {
+      .login-screen { grid-template-columns: 1fr; }
+      .login-brand { display: none; }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .form-grid, .modal-grid { grid-template-columns: 1fr; }
+      .span-2 { grid-column: auto; }
+    }
+    @media (max-width: 520px) {
+      .page { padding: 14px 12px 22px; }
+      .summary {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="loginView" class="login-screen hidden">
+    <section class="login-brand">
+      <h1>Nvidia Fucker</h1>
+    </section>
+    <section class="login-card">
+      <h2>后台登录</h2>
+      <form id="loginForm">
+        <label>Admin Token
+          <input id="token" type="password" autocomplete="current-password" autofocus>
+        </label>
+        <button id="loginButton" type="submit">登录</button>
+      </form>
+    </section>
+  </div>
+
+  <div id="appView" class="shell hidden">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">NF</div>
+        <h1>Nvidia Fucker</h1>
+      </div>
+      <div class="top-actions">
+        <button class="secondary" type="button" onclick="openConfigDialog()">全局配置</button>
+        <button class="secondary" type="button" onclick="loadAll()">刷新</button>
+        <button class="ghost" type="button" onclick="logout()">退出</button>
+      </div>
+    </header>
+
+    <main class="page">
+      <section class="summary">
+        <div class="metric total"><span>Key 总数</span><strong id="metricTotal">0</strong><small>全部</small></div>
+        <div class="metric healthy"><span>可路由</span><strong id="metricHealthy">0</strong><small>健康</small></div>
+        <div class="metric paused"><span>暂停</span><strong id="metricPaused">0</strong><small>待处理</small></div>
+        <div class="metric inflight"><span>当前并发</span><strong id="metricInflight">0</strong><small>实时</small></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Key 管理</h2>
+          <div class="toolbar">
+            <label>状态
+              <select id="statusFilter" onchange="changeStatusFilter()">
+                <option value="all">全部</option>
+                <option value="routable">可路由</option>
+                <option value="unavailable">不可用</option>
+                <option value="error">有错误</option>
+              </select>
+            </label>
+            <label>排序
+              <select id="sortMode" onchange="changeSortMode()">
+                <option value="default">默认排序</option>
+                <option value="lastUsedAt:desc">最近使用优先</option>
+                <option value="lastUsedAt:asc">最久使用优先</option>
+              </select>
+            </label>
+            <label>每页
+              <select id="pageSize" onchange="changePageSize()">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </label>
+            <button class="secondary" type="button" onclick="openImportDialog()">批量导入</button>
+            <button class="secondary" type="button" onclick="restoreAllKeys()">全部恢复</button>
+            <button type="button" onclick="openKeyDialog()">新增 Key</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>Key</th>
+                <th>中转站覆盖</th>
+                <th>代理覆盖</th>
+                <th>状态</th>
+                <th>并发</th>
+                <th>错误</th>
+                <th>最后使用</th>
+                <th style="text-align:right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="keysTable"></tbody>
+          </table>
+          <div id="emptyState" class="empty hidden">暂无 Key</div>
+        </div>
+        <div class="pager">
+          <span id="pagerInfo">第 1 / 1 页</span>
+          <div class="pager-actions">
+            <button class="secondary" id="prevPageButton" type="button" onclick="prevPage()">上一页</button>
+            <button class="secondary" id="nextPageButton" type="button" onclick="nextPage()">下一页</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="configDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2>全局配置</h2>
+        <button class="ghost" type="button" onclick="configDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <div class="modal-grid">
+          <label class="span-2">默认中转站地址
+            <input id="upstreamBaseUrl" placeholder="https://api.example.com">
+          </label>
+          <label class="span-2">默认代理地址
+            <input id="defaultProxyUrl" placeholder="http://127.0.0.1:7890">
+          </label>
+          <label class="span-2">请求 IP 白名单
+            <textarea id="ipAllowlist" placeholder="为空表示不限制&#10;127.0.0.1&#10;192.*"></textarea>
+          </label>
+          <label class="span-2">请求 IP 黑名单
+            <textarea id="ipBlocklist" placeholder="命中即拒绝&#10;127.*&#10;192.168.1.10"></textarea>
+          </label>
+        </div>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" type="button" onclick="configDialog.close()">取消</button>
+        <button id="saveConfigButton" type="button" onclick="saveConfig()">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="keyDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2 id="keyDialogTitle">新增 Key</h2>
+        <button class="ghost" type="button" onclick="keyDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <div class="modal-grid">
+          <label>名称<input id="name"></label>
+          <label>API Key<input id="apiKey" type="password"></label>
+          <label class="span-2">中转站地址覆盖<input id="baseUrl" placeholder="留空使用全局中转站地址"></label>
+          <label class="span-2">代理覆盖<input id="proxyUrl" placeholder="留空使用全局代理"></label>
+          <label>最大并发<input id="maxConcurrency" type="number" min="1" value="1"></label>
+          <label>启用<select id="enabled"><option value="true">启用</option><option value="false">停用</option></select></label>
+        </div>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" type="button" onclick="keyDialog.close()">取消</button>
+        <button id="saveKeyButton" type="button" onclick="saveKey()">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="importDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2>批量导入 Key</h2>
+        <button class="ghost" type="button" onclick="importDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <label class="span-2">Key 列表
+          <textarea id="importText" placeholder="sk-xxx&#10;名称,sk-xxx&#10;名称,sk-xxx,https://api.example.com,http://127.0.0.1:7890"></textarea>
+        </label>
+        <div class="modal-grid">
+          <label>导入中转站地址覆盖<input id="importBaseUrl" placeholder="留空使用全局中转站地址"></label>
+          <label>导入代理覆盖<input id="importProxyUrl" placeholder="留空使用全局代理"></label>
+          <label>导入最大并发<input id="importMaxConcurrency" type="number" min="1" value="1"></label>
+        </div>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" type="button" onclick="importDialog.close()">取消</button>
+        <button id="importButton" type="button" onclick="importKeys()">导入</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="captureDialog">
+    <div class="dialog-head">
+      <h2>最后一次请求与响应</h2>
+      <button class="ghost" type="button" onclick="captureDialog.close()">关闭</button>
+    </div>
+    <div class="dialog-body">
+      <div id="capture" class="capture-grid"></div>
+    </div>
+  </dialog>
+
+  <dialog id="testDialog">
+    <div class="dialog-head">
+      <h2 id="testDialogTitle">测试 Key</h2>
+      <button class="ghost" type="button" onclick="testDialog.close()">关闭</button>
+    </div>
+    <div class="dialog-body">
+      <div class="modal-grid">
+        <label class="span-2">模型
+          <select id="testModelSelect" onchange="selectTestModel()"></select>
+        </label>
+        <label class="span-2">手动输入模型
+          <input id="testModel" placeholder="下拉中没有时手动输入模型">
+        </label>
+        <label class="span-2">测试内容
+          <textarea id="testPrompt">ping</textarea>
+        </label>
+      </div>
+      <div id="testProgress" class="progress-list timeline hidden"></div>
+      <div id="testResult" class="capture-grid hidden"></div>
+    </div>
+    <div class="dialog-foot">
+      <button class="secondary" type="button" onclick="testDialog.close()">关闭</button>
+      <button id="runTestButton" type="button" onclick="runKeyTest()">开始测试</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script>
+    let editingId = "";
+    let keys = [];
+    let page = 1;
+    let pageSize = 100;
+    let total = 0;
+    let totalPages = 0;
+    let stats = { total: 0, healthy: 0, paused: 0, inflight: 0 };
+    let refreshTimer = 0;
+    let statusFilter = "all";
+    let sortBy = "default";
+    let sortOrder = "desc";
+    let testingId = "";
+
+    const el = id => document.getElementById(id);
+    const value = id => el(id).value.trim();
+    const setValue = (id, v) => { el(id).value = v ?? ""; };
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error(data.error || res.statusText);
+        err.status = res.status;
+        err.data = data;
+        throw err;
+      }
+      return data;
+    }
+
+    function toast(message, kind = "") {
+      const node = el("toast");
+      node.textContent = message;
+      node.className = `toast ${kind}`;
+      window.clearTimeout(node._timer);
+      node._timer = window.setTimeout(() => node.classList.add("hidden"), 2800);
+    }
+
+    function showLogin() {
+      el("loginView").classList.remove("hidden");
+      el("appView").classList.add("hidden");
+      window.clearInterval(refreshTimer);
+      setTimeout(() => el("token").focus(), 0);
+    }
+
+    function showApp() {
+      el("loginView").classList.add("hidden");
+      el("appView").classList.remove("hidden");
+      window.clearInterval(refreshTimer);
+      refreshTimer = window.setInterval(() => {
+        if (!el("appView").classList.contains("hidden")) loadAll(false);
+      }, 5000);
+    }
+
+    async function login(event) {
+      event.preventDefault();
+      const button = el("loginButton");
+      button.disabled = true;
+      try {
+        await api("/api/admin/login", { method: "POST", body: JSON.stringify({ token: value("token") }) });
+        showApp();
+        if (!await loadAll()) return;
+        toast("登录成功");
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function logout() {
+      await api("/api/admin/logout", { method: "POST" }).catch(() => {});
+      showLogin();
+    }
+
+    async function loadAll(showToast = true) {
+      try {
+        const cfg = await api("/api/admin/config");
+        if (!el("configDialog").open) {
+          fillConfigForm(cfg);
+        }
+        const params = new URLSearchParams({
+          page: String(page),
+          pageSize: String(pageSize),
+          status: statusFilter,
+          sort: sortBy,
+          order: sortOrder
+        });
+        const data = await api(`/api/admin/keys?${params.toString()}`);
+        keys = data.items || [];
+        total = data.total || 0;
+        page = data.page || 1;
+        pageSize = data.pageSize || pageSize;
+        totalPages = data.totalPages || 0;
+        stats = data.stats || stats;
+        setValue("pageSize", String(pageSize));
+        setValue("statusFilter", statusFilter);
+        setValue("sortMode", sortBy === "lastUsedAt" ? `lastUsedAt:${sortOrder}` : "default");
+        render();
+        if (showToast) toast("已加载");
+        return true;
+      } catch (e) {
+        if (e.status === 401) {
+          showLogin();
+          return false;
+        }
+        toast(e.message, "error");
+        return false;
+      }
+    }
+
+    function openConfigDialog() {
+      configDialog.showModal();
+    }
+
+    function fillConfigForm(cfg) {
+      setValue("upstreamBaseUrl", cfg.upstreamBaseUrl || "");
+      setValue("defaultProxyUrl", cfg.defaultProxyUrl || "");
+      setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
+      setValue("ipBlocklist", joinRules(cfg.ipBlocklist || []));
+    }
+
+    async function saveConfig() {
+      const button = el("saveConfigButton");
+      button.disabled = true;
+      try {
+        await api("/api/admin/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            upstreamBaseUrl: value("upstreamBaseUrl"),
+            defaultProxyUrl: value("defaultProxyUrl"),
+            ipAllowlist: splitRules(value("ipAllowlist")),
+            ipBlocklist: splitRules(value("ipBlocklist"))
+          })
+        });
+        configDialog.close();
+        toast("配置已保存");
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function changePageSize() {
+      pageSize = Number(value("pageSize") || "100");
+      if (pageSize > 1000) pageSize = 1000;
+      page = 1;
+      loadAll(false);
+    }
+
+    function changeStatusFilter() {
+      statusFilter = value("statusFilter") || "all";
+      page = 1;
+      loadAll(false);
+    }
+
+    function changeSortMode() {
+      const [nextSort, nextOrder] = (value("sortMode") || "default").split(":");
+      sortBy = nextSort || "default";
+      sortOrder = nextOrder || "desc";
+      page = 1;
+      loadAll(false);
+    }
+
+    function prevPage() {
+      if (page <= 1) return;
+      page--;
+      loadAll(false);
+    }
+
+    function nextPage() {
+      if (totalPages > 0 && page >= totalPages) return;
+      page++;
+      loadAll(false);
+    }
+
+    function openKeyDialog(id = "") {
+      editingId = id;
+      const key = keys.find(k => k.id === id);
+      el("keyDialogTitle").textContent = key ? "编辑 Key" : "新增 Key";
+      setValue("name", key?.name || "");
+      setValue("apiKey", key?.apiKey || "");
+      setValue("baseUrl", key?.baseUrl || "");
+      setValue("proxyUrl", key?.proxyUrl || "");
+      setValue("maxConcurrency", String(key?.maxConcurrency || 1));
+      setValue("enabled", String(key ? key.enabled : true));
+      keyDialog.showModal();
+    }
+
+    async function saveKey() {
+      const existing = keys.find(k => k.id === editingId);
+      const payload = {
+        name: value("name"),
+        apiKey: value("apiKey"),
+        baseUrl: value("baseUrl"),
+        proxyUrl: value("proxyUrl"),
+        maxConcurrency: Number(value("maxConcurrency") || "1"),
+        enabled: value("enabled") === "true",
+        paused: existing?.paused || false,
+        balanceDepleted: existing?.balanceDepleted || false
+      };
+      el("saveKeyButton").disabled = true;
+      try {
+        if (editingId) await api(`/api/admin/keys/${editingId}`, { method: "PUT", body: JSON.stringify(payload) });
+        else await api("/api/admin/keys", { method: "POST", body: JSON.stringify(payload) });
+        keyDialog.close();
+        await loadAll(false);
+        toast("Key 已保存");
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        el("saveKeyButton").disabled = false;
+      }
+    }
+
+    function openImportDialog() {
+      setValue("importText", "");
+      setValue("importBaseUrl", "");
+      setValue("importProxyUrl", "");
+      setValue("importMaxConcurrency", "1");
+      importDialog.showModal();
+    }
+
+    async function importKeys() {
+      el("importButton").disabled = true;
+      try {
+        const result = await api("/api/admin/keys/import", {
+          method: "POST",
+          body: JSON.stringify({
+            text: value("importText"),
+            baseUrl: value("importBaseUrl"),
+            proxyUrl: value("importProxyUrl"),
+            maxConcurrency: Number(value("importMaxConcurrency") || "1"),
+            enabled: true
+          })
+        });
+        importDialog.close();
+        page = 1;
+        await loadAll(false);
+        toast(`导入 ${result.imported} 个，跳过 ${result.skipped} 个${result.errors?.length ? "，有错误" : ""}`, result.errors?.length ? "error" : "");
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        el("importButton").disabled = false;
+      }
+    }
+
+    async function restoreKey(id) {
+      try {
+        await api(`/api/admin/keys/${id}/restore`, { method: "POST" });
+        await loadAll(false);
+        toast("已恢复");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function restoreAllKeys() {
+      if (!confirm("确认恢复全部 Key？这会清除所有暂停、余额不足和错误计数状态。")) return;
+      try {
+        const result = await api("/api/admin/keys/restore-all", { method: "POST" });
+        await loadAll(false);
+        toast(`已恢复 ${result.restored || 0} 个 Key`);
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function deleteKey(id) {
+      if (!confirm("确认删除这个 Key？")) return;
+      try {
+        await api(`/api/admin/keys/${id}`, { method: "DELETE" });
+        await loadAll(false);
+        toast("已删除");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function showCapture(id) {
+      try {
+        const data = await api(`/api/admin/keys/${id}/capture`);
+        renderCapture(data);
+        captureDialog.showModal();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function openTestDialog(id) {
+      testingId = id;
+      const key = keys.find(k => k.id === id);
+      el("testDialogTitle").textContent = `测试 ${key?.name || "Key"}`;
+      setValue("testModel", "");
+      el("testModelSelect").innerHTML = `<option value="">加载模型中...</option>`;
+      setValue("testPrompt", "ping");
+      el("testProgress").classList.add("hidden");
+      el("testProgress").innerHTML = "";
+      el("testResult").classList.add("hidden");
+      el("testResult").innerHTML = "";
+      testDialog.showModal();
+      try {
+        const data = await api(`/api/admin/keys/${id}/models`);
+        const models = data.models || [];
+        el("testModelSelect").innerHTML = [
+          `<option value="">手动输入...</option>`,
+          ...models.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
+        ].join("");
+        if (models.length > 0) {
+          el("testModelSelect").value = models[0];
+          setValue("testModel", models[0]);
+        } else {
+          toast("未获取到模型列表，请手动输入模型", "error");
+        }
+      } catch (e) {
+        el("testModelSelect").innerHTML = `<option value="">手动输入...</option>`;
+        toast(`模型列表获取失败：${e.message}，可手动输入`, "error");
+      }
+    }
+
+    function selectTestModel() {
+      const selected = value("testModelSelect");
+      if (selected) setValue("testModel", selected);
+    }
+
+    async function runKeyTest() {
+      if (!testingId) return;
+      const button = el("runTestButton");
+      button.disabled = true;
+      el("testProgress").classList.remove("hidden");
+      el("testProgress").innerHTML = "";
+      el("testResult").classList.add("hidden");
+      try {
+        const res = await fetch(`/api/admin/keys/${testingId}/test-progress`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: value("testModel"),
+            prompt: value("testPrompt") || "ping"
+          })
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || res.statusText);
+        }
+        const result = await readTestProgress(res);
+        if (result) {
+          renderTestResult(result);
+          await loadAll(false);
+          toast(result.error ? "测试失败" : "测试完成", result.error ? "error" : "");
+        }
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function readTestProgress(res) {
+      if (!res.body) {
+        const text = await res.text();
+        text.split("\n").filter(Boolean).forEach(line => handleTestEvent(JSON.parse(line)));
+        return window._lastTestResult || null;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult = null;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          handleTestEvent(event);
+          if (event.result) finalResult = event.result;
+        }
+      }
+      if (buffer.trim()) {
+        const event = JSON.parse(buffer);
+        handleTestEvent(event);
+        if (event.result) finalResult = event.result;
+      }
+      return finalResult;
+    }
+
+    function handleTestEvent(event) {
+      appendTestProgress(event);
+      if (event.result) window._lastTestResult = event.result;
+    }
+
+    function appendTestProgress(event) {
+      const node = el("testProgress");
+      node.classList.remove("hidden");
+      const row = document.createElement("div");
+      row.className = `progress-item ${event.error ? "bad" : ""}`;
+      row.innerHTML = timelineItemHtml(event);
+      node.appendChild(row);
+      row.scrollIntoView({ block: "nearest" });
+    }
+
+    function renderTestResult(result) {
+      const node = el("testResult");
+      node.classList.remove("hidden");
+      node.innerHTML = `
+        <div class="capture-meta">
+          ${captureField("响应状态", String(result.statusCode || "-"))}
+          ${captureField("耗时", result.durationMs != null ? `${result.durationMs} ms` : "-")}
+          ${captureField("结果", result.error ? "失败" : "完成")}
+        </div>
+        ${captureSection("响应头", formatJSON(result.responseHeader || {}))}
+        ${captureSection("响应数据", formatPayload(result.responseBody))}
+        ${result.error ? captureSection("错误", result.error) : ""}
+      `;
+    }
+
+    function renderCapture(data) {
+      el("capture").innerHTML = `
+        <div class="capture-meta">
+          ${captureField("请求地址", data.requestUrl || "-")}
+          ${captureField("响应状态", String(data.statusCode || "-"))}
+          ${captureField("耗时", data.durationMs != null ? `${data.durationMs} ms` : "-")}
+        </div>
+        ${captureSection("请求头", formatJSON(data.requestHeader || {}))}
+        ${captureSection("请求数据", formatPayload(data.requestBody))}
+        ${captureNetworkSection(data.networkEvents || [])}
+        ${captureSection("响应头", formatJSON(data.responseHeader || {}))}
+        ${captureSection("响应数据", formatPayload(data.responseBody))}
+        ${data.error ? captureSection("错误", data.error) : ""}
+      `;
+    }
+
+    function captureNetworkSection(events) {
+      const rows = Array.isArray(events) && events.length
+        ? events.map(event => `<div class="progress-item ${event.error ? "bad" : ""}">${timelineItemHtml(event)}</div>`).join("")
+        : `<div class="progress-empty">暂无链路记录</div>`;
+      return `<section class="capture-section"><h3>网络链路</h3><div class="progress-list timeline">${rows}</div></section>`;
+    }
+
+    function timelineItemHtml(event) {
+      const meta = [];
+      if (event.attempt) meta.push(`第 ${event.attempt} 次`);
+      if (event.durationMs != null && event.durationMs !== 0) meta.push(`${event.durationMs} ms`);
+      const suffix = meta.length ? ` · ${meta.join(" · ")}` : "";
+      const elapsed = event.elapsedMs != null ? `+${event.elapsedMs}ms` : "-";
+      return `<em class="progress-time">${escapeHtml(elapsed)}</em><strong>${escapeHtml(event.step || "-")}</strong><span>${escapeHtml(event.message || "")}${escapeHtml(suffix)}${event.error ? `<br><small>${escapeHtml(event.error)}</small>` : ""}</span>`;
+    }
+
+    function joinRules(values) {
+      return Array.isArray(values) ? values.join("\n") : "";
+    }
+
+    function splitRules(text) {
+      return String(text || "")
+        .split(/[\n,\t\r]+/)
+        .map(v => v.trim())
+        .filter(Boolean);
+    }
+
+    function captureField(label, value) {
+      return `<div class="capture-field"><span>${escapeHtml(label)}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong></div>`;
+    }
+
+    function captureSection(title, content) {
+      return `<section class="capture-section"><h3>${escapeHtml(title)}</h3><pre>${escapeHtml(content || "-")}</pre></section>`;
+    }
+
+    function formatJSON(value) {
+      return JSON.stringify(value, null, 2);
+    }
+
+    function formatPayload(value) {
+      if (!value) return "";
+      const text = String(value);
+      try {
+        return JSON.stringify(JSON.parse(text), null, 2);
+      } catch (_) {
+        return text;
+      }
+    }
+
+    function render() {
+      el("metricTotal").textContent = stats.total || 0;
+      el("metricHealthy").textContent = stats.healthy || 0;
+      el("metricPaused").textContent = stats.paused || 0;
+      el("metricInflight").textContent = stats.inflight || 0;
+
+      el("emptyState").classList.toggle("hidden", total > 0);
+      el("pagerInfo").textContent = total === 0
+        ? "暂无数据"
+        : `第 ${page} / ${totalPages || 1} 页，共 ${total} 条`;
+      el("prevPageButton").disabled = page <= 1;
+      el("nextPageButton").disabled = totalPages === 0 || page >= totalPages;
+      el("keysTable").innerHTML = keys.map(k => `
+        <tr>
+          <td><strong>${escapeHtml(k.name)}</strong></td>
+          <td class="mono">${maskKey(k.apiKey)}</td>
+          <td class="truncate">${escapeHtml(k.baseUrl || "使用全局")}</td>
+          <td class="truncate">${escapeHtml(k.proxyUrl || "使用全局")}</td>
+          <td>${statusPill(k)}</td>
+          <td>${k.currentConcurrency || 0}/${k.maxConcurrency}</td>
+          <td><span>${k.consecutiveErrors || 0}</span>${k.lastError ? `<div class="muted truncate">${escapeHtml(k.lastError)}</div>` : ""}</td>
+          <td>${formatDateTime(k.lastUsedAt)}</td>
+          <td>
+            <div class="row-actions">
+              <button class="secondary" type="button" onclick="openTestDialog('${k.id}')">测试</button>
+              <button class="secondary" type="button" onclick="openKeyDialog('${k.id}')">编辑</button>
+              <button class="secondary" type="button" onclick="restoreKey('${k.id}')">恢复</button>
+              <button class="secondary" type="button" onclick="showCapture('${k.id}')">详情</button>
+              <button class="danger" type="button" onclick="deleteKey('${k.id}')">删除</button>
+            </div>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    function statusPill(k) {
+      if (!k.enabled) return `<span class="pill warn">停用</span>`;
+      if (k.balanceDepleted) return `<span class="pill bad">余额不足</span>`;
+      if (k.paused) return `<span class="pill bad">暂停</span>`;
+      return `<span class="pill">可用</span>`;
+    }
+
+    function formatDateTime(value) {
+      if (!value || String(value).startsWith("0001-")) return "<span class=\"muted\">-</span>";
+      return new Date(value).toLocaleString();
+    }
+
+    function maskKey(key) {
+      if (!key) return "";
+      if (key.length <= 10) return escapeHtml(key.slice(0, 2) + "***");
+      return escapeHtml(`${key.slice(0, 6)}...${key.slice(-4)}`);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+    }
+
+    el("loginForm").addEventListener("submit", login);
+    loadAll(false).then(ok => ok ? showApp() : showLogin()).catch(showLogin);
+  </script>
+</body>
+</html>

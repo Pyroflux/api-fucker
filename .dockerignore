@@ -1,0 +1,10 @@
+.git
+.idea
+bin
+dist
+data.db
+*.db
+*.db-*
+.DS_Store
+Dockerfile
+README.md
