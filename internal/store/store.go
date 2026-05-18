@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,7 +18,9 @@ const (
 	keysBucket     = "keys"
 	metaBucket     = "meta"
 	captureBucket  = "captures"
+	metricsBucket  = "metrics"
 	globalConfigID = "global"
+	metricsMaxAge  = 7 * 24 * time.Hour
 )
 
 var (
@@ -48,6 +51,7 @@ type Key struct {
 	BalanceDepleted   bool      `json:"balanceDepleted"`
 	ConsecutiveErrors int       `json:"consecutiveErrors"`
 	LastError         string    `json:"lastError"`
+	LastFirstByteMS   *int64    `json:"lastFirstByteMs,omitempty"`
 	LastUsedAt        time.Time `json:"lastUsedAt"`
 	CreatedAt         time.Time `json:"createdAt"`
 	UpdatedAt         time.Time `json:"updatedAt"`
@@ -79,6 +83,30 @@ type BulkUpdateResult struct {
 
 type BulkDeleteResult struct {
 	Deleted int `json:"deleted"`
+}
+
+type MetricSample struct {
+	Time        time.Time
+	FirstByteMS *int64
+	Concurrency int
+	Error       bool
+}
+
+type metricBucketRecord struct {
+	Time             time.Time `json:"time"`
+	Requests         int       `json:"requests"`
+	FirstByteTotalMS int64     `json:"firstByteTotalMs"`
+	FirstByteSamples int       `json:"firstByteSamples"`
+	MaxConcurrency   int       `json:"maxConcurrency"`
+	Errors           int       `json:"errors"`
+}
+
+type MetricPoint struct {
+	Time        time.Time `json:"time"`
+	FirstByteMS *int64    `json:"firstByteMs,omitempty"`
+	Concurrency int       `json:"concurrency"`
+	Errors      int       `json:"errors"`
+	Requests    int       `json:"requests"`
 }
 
 type Capture struct {
@@ -131,6 +159,9 @@ func (s *Store) init() error {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists([]byte(captureBucket)); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists([]byte(metricsBucket)); err != nil {
 			return err
 		}
 		b := tx.Bucket([]byte(metaBucket))
@@ -518,6 +549,110 @@ func (s *Store) SaveCapture(c Capture) error {
 	})
 }
 
+func (s *Store) RecordMetric(keyID string, sample MetricSample) error {
+	now := sample.Time.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	bucketTime := now.Truncate(time.Minute)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		metrics := tx.Bucket([]byte(metricsBucket))
+		if err := deleteOldMetrics(metrics, now.Add(-metricsMaxAge)); err != nil {
+			return err
+		}
+
+		record := metricBucketRecord{Time: bucketTime}
+		metricKey := metricBucketKey(bucketTime)
+		if raw := metrics.Get(metricKey); raw != nil {
+			if err := json.Unmarshal(raw, &record); err != nil {
+				return err
+			}
+		}
+		record.Requests++
+		if sample.FirstByteMS != nil {
+			record.FirstByteTotalMS += *sample.FirstByteMS
+			record.FirstByteSamples++
+		}
+		if sample.Concurrency > record.MaxConcurrency {
+			record.MaxConcurrency = sample.Concurrency
+		}
+		if sample.Error {
+			record.Errors++
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		if err := metrics.Put(metricKey, raw); err != nil {
+			return err
+		}
+		if sample.FirstByteMS == nil || strings.TrimSpace(keyID) == "" {
+			return nil
+		}
+		return updateKeyFirstByte(tx, keyID, *sample.FirstByteMS, now)
+	})
+}
+
+func (s *Store) ListMetrics(granularity string, now time.Time) ([]MetricPoint, error) {
+	now = now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	start := now.Add(-metricsMaxAge)
+	truncate := metricTruncator(granularity)
+	aggregated := make(map[int64]metricBucketRecord)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		metrics := tx.Bucket([]byte(metricsBucket))
+		return metrics.ForEach(func(_, raw []byte) error {
+			var record metricBucketRecord
+			if err := json.Unmarshal(raw, &record); err != nil {
+				return err
+			}
+			record.Time = record.Time.UTC()
+			if record.Time.Before(start) || record.Time.After(now) {
+				return nil
+			}
+			pointTime := truncate(record.Time)
+			key := pointTime.Unix()
+			next := aggregated[key]
+			if next.Time.IsZero() {
+				next.Time = pointTime
+			}
+			next.Requests += record.Requests
+			next.FirstByteTotalMS += record.FirstByteTotalMS
+			next.FirstByteSamples += record.FirstByteSamples
+			if record.MaxConcurrency > next.MaxConcurrency {
+				next.MaxConcurrency = record.MaxConcurrency
+			}
+			next.Errors += record.Errors
+			aggregated[key] = next
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	points := make([]MetricPoint, 0, len(aggregated))
+	for _, record := range aggregated {
+		var firstByte *int64
+		if record.FirstByteSamples > 0 {
+			avg := record.FirstByteTotalMS / int64(record.FirstByteSamples)
+			firstByte = &avg
+		}
+		points = append(points, MetricPoint{
+			Time:        record.Time,
+			FirstByteMS: firstByte,
+			Concurrency: record.MaxConcurrency,
+			Errors:      record.Errors,
+			Requests:    record.Requests,
+		})
+	}
+	sort.Slice(points, func(i, j int) bool {
+		return points[i].Time.Before(points[j].Time)
+	})
+	return points, nil
+}
+
 func (s *Store) GetCapture(keyID string) (Capture, error) {
 	var c Capture
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -528,6 +663,60 @@ func (s *Store) GetCapture(keyID string) (Capture, error) {
 		return json.Unmarshal(raw, &c)
 	})
 	return c, err
+}
+
+func updateKeyFirstByte(tx *bolt.Tx, id string, firstByteMS int64, now time.Time) error {
+	b := tx.Bucket([]byte(keysBucket))
+	raw := b.Get([]byte(id))
+	if raw == nil {
+		return nil
+	}
+	var key Key
+	if err := json.Unmarshal(raw, &key); err != nil {
+		return err
+	}
+	key.LastFirstByteMS = &firstByteMS
+	key.UpdatedAt = now.UTC()
+	next, err := json.Marshal(key)
+	if err != nil {
+		return err
+	}
+	return b.Put([]byte(id), next)
+}
+
+func metricBucketKey(t time.Time) []byte {
+	return []byte(fmt.Sprintf("%020d", t.UTC().Truncate(time.Minute).Unix()))
+}
+
+func deleteOldMetrics(b *bolt.Bucket, cutoff time.Time) error {
+	c := b.Cursor()
+	for k, raw := c.First(); k != nil; k, raw = c.Next() {
+		var record metricBucketRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return err
+		}
+		if !record.Time.Before(cutoff) {
+			continue
+		}
+		if err := c.Delete(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func metricTruncator(granularity string) func(time.Time) time.Time {
+	switch strings.TrimSpace(granularity) {
+	case "hour":
+		return func(t time.Time) time.Time { return t.UTC().Truncate(time.Hour) }
+	case "day":
+		return func(t time.Time) time.Time {
+			t = t.UTC()
+			return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		}
+	default:
+		return func(t time.Time) time.Time { return t.UTC().Truncate(time.Minute) }
+	}
 }
 
 func (s *Store) saveKey(key Key) (Key, error) {

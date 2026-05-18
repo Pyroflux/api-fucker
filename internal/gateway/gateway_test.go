@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,9 @@ func TestGatewayForwardsAndRecordsCapture(t *testing.T) {
 		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			if r.Header.Get("Authorization") != "Bearer secret" {
 				t.Fatalf("missing upstream auth: %s", r.Header.Get("Authorization"))
+			}
+			if trace := httptrace.ContextClientTrace(r.Context()); trace != nil && trace.GotFirstResponseByte != nil {
+				trace.GotFirstResponseByte()
 			}
 			var body bytes.Buffer
 			_ = json.NewEncoder(&body).Encode(map[string]string{"ok": "true"})
@@ -66,6 +70,20 @@ func TestGatewayForwardsAndRecordsCapture(t *testing.T) {
 	}
 	if strings.Contains(text, "代理") {
 		t.Fatalf("direct capture should not mention proxy: %s", text)
+	}
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastFirstByteMS == nil {
+		t.Fatalf("expected last first byte to be recorded: %+v", updated)
+	}
+	points, err := st.ListMetrics("minute", time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Requests != 1 || points[0].Errors != 0 || points[0].Concurrency != 1 || points[0].FirstByteMS == nil {
+		t.Fatalf("unexpected metrics: %+v", points)
 	}
 }
 
@@ -150,15 +168,22 @@ func TestGatewayForwardsModelsList(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "deepseek-ai/deepseek-v4-flash") {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
-	capture, err := st.GetCapture(key.ID)
+	if _, err := st.GetCapture(key.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("models response should not be captured, got %v", err)
+	}
+	points, err := st.ListMetrics("minute", time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capture.RequestMethod != http.MethodGet || capture.RequestURL != "https://upstream.example/v1/models" {
-		t.Fatalf("bad capture: %+v", capture)
+	if len(points) != 0 {
+		t.Fatalf("models response should not be recorded in metrics: %+v", points)
 	}
-	if text := captureNetworkText(capture.NetworkEvents); !strings.Contains(text, "准备直连上游") {
-		t.Fatalf("missing model list network events: %s", text)
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.LastUsedAt.IsZero() || updated.ConsecutiveErrors != 0 || updated.LastFirstByteMS != nil {
+		t.Fatalf("models response should not update key usage state: %+v", updated)
 	}
 }
 

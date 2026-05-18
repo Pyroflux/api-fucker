@@ -131,18 +131,26 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		capture.Error = forwardErr.Error()
 	}
 	capture.NetworkEvents = progress.events()
-	_ = g.store.SaveCapture(capture)
+	if upstreamPath == chatPath {
+		_ = g.store.SaveCapture(capture)
+		_ = g.store.RecordMetric(selected.key.ID, store.MetricSample{
+			Time:        capture.Time,
+			FirstByteMS: firstByteElapsedMS(capture.NetworkEvents),
+			Concurrency: g.totalConcurrency(),
+			Error:       forwardErr != nil || status >= 400,
+		})
 
-	if forwardErr != nil {
-		_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false)
-		return
+		if forwardErr != nil {
+			_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false)
+			return
+		}
+		if status >= 400 {
+			msg := truncate(string(respBody), 1000)
+			_, _ = g.store.RecordFailure(selected.key.ID, msg, looksBalanceDepleted(status, respBody))
+			return
+		}
+		_ = g.store.RecordSuccess(selected.key.ID)
 	}
-	if status >= 400 {
-		msg := truncate(string(respBody), 1000)
-		_, _ = g.store.RecordFailure(selected.key.ID, msg, looksBalanceDepleted(status, respBody))
-		return
-	}
-	_ = g.store.RecordSuccess(selected.key.ID)
 }
 
 func routeRequest(r *http.Request) (string, string, error) {
@@ -164,6 +172,16 @@ func (g *Gateway) CurrentConcurrency() map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+func (g *Gateway) totalConcurrency() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	total := 0
+	for _, v := range g.inflight {
+		total += v
+	}
+	return total
 }
 
 func (g *Gateway) acquireKey() (selectedKey, error) {
@@ -304,30 +322,9 @@ func (g *Gateway) ListModelsForKey(ctx context.Context, key store.Key, cfg store
 	if err != nil {
 		return ModelListResult{}, err
 	}
-	progress := newCaptureProgressRecorder(nil)
-	emitRequestReady(progress.emit, selected)
-	capture := store.Capture{
-		KeyID:         key.ID,
-		Time:          time.Now().UTC(),
-		RequestMethod: http.MethodGet,
-		RequestURL:    joinURL(selected.baseURL, modelsPath),
-	}
-	start := time.Now()
-	status, header, body, err := g.doBufferedWithProgress(ctx, selected, http.MethodGet, modelsPath, nil, progress.emit)
-	capture.DurationMS = time.Since(start).Milliseconds()
-	capture.StatusCode = status
-	capture.ResponseHeader = redactHeader(header)
-	capture.ResponseBody = string(body)
-	capture.NetworkEvents = progress.events()
+	status, _, body, err := g.doBuffered(ctx, selected, http.MethodGet, modelsPath, nil)
 	if err != nil {
-		capture.Error = err.Error()
-		if g.store != nil {
-			_ = g.store.SaveCapture(capture)
-		}
 		return ModelListResult{}, err
-	}
-	if g.store != nil {
-		_ = g.store.SaveCapture(capture)
 	}
 	var raw any
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -519,6 +516,17 @@ func (r *captureProgressRecorder) emit(event TestProgressEvent) {
 
 func (r *captureProgressRecorder) events() []store.CaptureNetworkEvent {
 	return append([]store.CaptureNetworkEvent(nil), r.items...)
+}
+
+func firstByteElapsedMS(events []store.CaptureNetworkEvent) *int64 {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Step != "first_byte" {
+			continue
+		}
+		value := events[i].ElapsedMS
+		return &value
+	}
+	return nil
 }
 
 func shouldCaptureNetworkEvent(event TestProgressEvent) bool {

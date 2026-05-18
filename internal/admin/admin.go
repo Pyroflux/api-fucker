@@ -124,6 +124,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.bulkDeleteKeys(w, r)
 	case r.URL.Path == "/api/admin/keys/restore-all":
 		h.restoreAllKeys(w, r)
+	case r.URL.Path == "/api/admin/metrics":
+		h.metrics(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/admin/keys/"):
 		h.keyByID(w, r)
 	default:
@@ -190,6 +192,56 @@ func (h *Handler) restoreAllKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	restored, err := h.store.RestoreAllKeys()
 	respond(w, map[string]int{"restored": restored}, err)
+}
+
+func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	granularity := r.URL.Query().Get("granularity")
+	now := time.Now().UTC()
+	points, err := h.store.ListMetrics(granularity, now)
+	if err == nil {
+		points = appendLiveConcurrencyPoint(points, granularity, now, totalInflight(h.currentConcurrency()))
+	}
+	respond(w, map[string]any{"items": points}, err)
+}
+
+func appendLiveConcurrencyPoint(points []store.MetricPoint, granularity string, now time.Time, inflight int) []store.MetricPoint {
+	if inflight <= 0 {
+		return points
+	}
+	pointTime := metricPointTime(now, granularity)
+	for i := range points {
+		if points[i].Time.Equal(pointTime) {
+			if inflight > points[i].Concurrency {
+				points[i].Concurrency = inflight
+			}
+			return points
+		}
+	}
+	return append(points, store.MetricPoint{Time: pointTime, Concurrency: inflight})
+}
+
+func totalInflight(values map[string]int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func metricPointTime(t time.Time, granularity string) time.Time {
+	t = t.UTC()
+	switch strings.TrimSpace(granularity) {
+	case "hour":
+		return t.Truncate(time.Hour)
+	case "day":
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	default:
+		return t.Truncate(time.Minute)
+	}
 }
 
 func (h *Handler) importKeys(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestCreateRestoreAndCapture(t *testing.T) {
@@ -218,5 +219,52 @@ func TestBulkUpdateConcurrencyAndDeleteKeys(t *testing.T) {
 	}
 	if len(keys) != 0 {
 		t.Fatalf("keys left = %d, want 0", len(keys))
+	}
+}
+
+func TestMetricsAggregateAndTrackFirstByte(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 5, 18, 10, 30, 0, 0, time.UTC)
+	first := int64(120)
+	second := int64(240)
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now, FirstByteMS: &first, Concurrency: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now.Add(20 * time.Second), FirstByteMS: &second, Concurrency: 5, Error: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now.Add(-8 * 24 * time.Hour), Concurrency: 9, Error: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := st.ListMetrics("minute", now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("points = %d, want 1: %+v", len(points), points)
+	}
+	point := points[0]
+	if point.Requests != 2 || point.Errors != 1 || point.Concurrency != 5 {
+		t.Fatalf("unexpected point counters: %+v", point)
+	}
+	if point.FirstByteMS == nil || *point.FirstByteMS != 180 {
+		t.Fatalf("first byte avg = %v, want 180", point.FirstByteMS)
+	}
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastFirstByteMS == nil || *updated.LastFirstByteMS != second {
+		t.Fatalf("last first byte = %v, want %d", updated.LastFirstByteMS, second)
 	}
 }

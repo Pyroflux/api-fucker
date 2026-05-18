@@ -50,6 +50,7 @@
     button.ghost { border-color: transparent; background: transparent; color: var(--muted-strong); }
     button.ghost:hover { background: #edf1f6; }
     button.danger { border-color: var(--danger); background: var(--danger); }
+    button.danger:hover { background: #912018; }
     input, textarea, select {
       width: 100%;
       min-height: 36px;
@@ -222,6 +223,28 @@
     }
     .panel-header h2 { margin: 0; font-size: 15px; }
     .panel-body { padding: 16px; }
+    .view-tabs {
+      display: inline-flex;
+      gap: 6px;
+      width: fit-content;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+    }
+    .view-tabs button {
+      height: 32px;
+      border-color: transparent;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted-strong);
+      font-weight: 800;
+    }
+    .view-tabs button.active {
+      background: var(--primary);
+      color: #fff;
+    }
+    .page-view { display: grid; gap: 14px; }
     .form-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
@@ -239,8 +262,45 @@
     .toolbar select { width: auto; min-width: 92px; }
     .toolbar input { width: 88px; min-width: 88px; }
 
+    .bulk-selection-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+      background:
+        linear-gradient(90deg, rgba(15, 118, 110, .10), rgba(255, 255, 255, .86)),
+        var(--surface-soft);
+    }
+    .bulk-selection-copy {
+      display: grid;
+      gap: 2px;
+      min-width: 180px;
+    }
+    .bulk-selection-copy strong { font-size: 14px; }
+    .bulk-selection-copy span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .bulk-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .danger-copy {
+      border: 1px solid #fda29b;
+      border-radius: 6px;
+      background: #fff6f5;
+      color: var(--danger);
+      padding: 10px 12px;
+      font-weight: 700;
+    }
+
     .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; min-width: 1120px; }
+    table { width: 100%; border-collapse: collapse; min-width: 1200px; }
     th, td {
       padding: 12px 10px;
       border-bottom: 1px solid var(--line);
@@ -288,6 +348,112 @@
       color: var(--muted);
     }
     .pager-actions { display: flex; align-items: center; gap: 8px; }
+
+    .monitor-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .segmented {
+      display: inline-flex;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }
+    .segmented button {
+      height: 30px;
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted-strong);
+      border-radius: 6px;
+      font-weight: 800;
+    }
+    .segmented button.active {
+      border-color: var(--primary);
+      background: #edf8f6;
+      color: var(--primary);
+    }
+    .chart-wrap {
+      position: relative;
+      min-height: 380px;
+      padding: 12px;
+    }
+    #monitorChart {
+      display: block;
+      width: 100%;
+      height: 360px;
+    }
+    .chart-empty {
+      position: absolute;
+      inset: 12px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      pointer-events: none;
+    }
+    .chart-tooltip {
+      position: absolute;
+      min-width: 180px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .96);
+      color: var(--text);
+      box-shadow: var(--shadow);
+      padding: 9px 10px;
+      font-size: 12px;
+      pointer-events: none;
+      transform: translate(-50%, calc(-100% - 12px));
+      z-index: 3;
+    }
+    .chart-tooltip strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--text);
+      font-size: 12px;
+    }
+    .chart-tooltip .tip-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      line-height: 1.7;
+    }
+    .chart-tooltip .tip-label {
+      display: inline-flex;
+      align-items: center;
+    }
+    .chart-tooltip i {
+      width: 8px;
+      height: 8px;
+      display: inline-block;
+      border-radius: 999px;
+      background: var(--tip-color);
+      margin-right: 6px;
+    }
+    .chart-legend {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted-strong);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legend-swatch {
+      width: 18px;
+      height: 3px;
+      border-radius: 999px;
+      background: var(--legend-color);
+    }
 
     dialog {
       width: min(760px, calc(100vw - 32px));
@@ -409,6 +575,8 @@
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .form-grid, .modal-grid { grid-template-columns: 1fr; }
       .span-2 { grid-column: auto; }
+      .bulk-selection-bar { align-items: stretch; flex-direction: column; }
+      .bulk-actions { justify-content: flex-start; }
     }
     @media (max-width: 520px) {
       .page { padding: 14px 12px 22px; }
@@ -443,20 +611,26 @@
       </div>
       <div class="top-actions">
         <button class="secondary" type="button" onclick="openConfigDialog()">全局配置</button>
-        <button class="secondary" type="button" onclick="loadAll()">刷新</button>
+        <button class="secondary" type="button" onclick="refreshActiveView()">刷新</button>
         <button class="ghost" type="button" onclick="logout()">退出</button>
       </div>
     </header>
 
     <main class="page">
-      <section class="summary">
-        <div class="metric total"><span>Key 总数</span><strong id="metricTotal">0</strong><small>全部</small></div>
-        <div class="metric healthy"><span>可路由</span><strong id="metricHealthy">0</strong><small>健康</small></div>
-        <div class="metric paused"><span>暂停</span><strong id="metricPaused">0</strong><small>待处理</small></div>
-        <div class="metric inflight"><span>当前并发</span><strong id="metricInflight">0</strong><small>实时</small></div>
-      </section>
+      <div class="view-tabs" aria-label="后台页面">
+        <button id="keysTabButton" class="active" type="button" onclick="switchAdminTab('keys')">Key 管理</button>
+        <button id="monitorTabButton" type="button" onclick="switchAdminTab('monitor')">监控</button>
+      </div>
 
-      <section class="panel">
+      <div id="keyManagementView" class="page-view">
+        <section class="summary">
+          <div class="metric total"><span>Key 总数</span><strong id="metricTotal">0</strong><small>全部</small></div>
+          <div class="metric healthy"><span>可路由</span><strong id="metricHealthy">0</strong><small>健康</small></div>
+          <div class="metric paused"><span>暂停</span><strong id="metricPaused">0</strong><small>待处理</small></div>
+          <div class="metric inflight"><span>当前并发</span><strong id="metricInflight">0</strong><small>实时</small></div>
+        </section>
+
+        <section class="panel">
         <div class="panel-header">
           <h2>Key 管理</h2>
           <div class="toolbar">
@@ -486,16 +660,20 @@
             </label>
             <button class="secondary" type="button" onclick="openImportDialog()">批量导入</button>
             <button class="secondary" type="button" onclick="restoreAllKeys()">全部恢复</button>
-            <label>范围
-              <select id="bulkScope">
-                <option value="selected">选中</option>
-                <option value="all">全部</option>
-              </select>
-            </label>
-            <label>并发<input id="bulkMaxConcurrency" type="number" min="1" value="1"></label>
-            <button class="secondary" type="button" onclick="bulkUpdateConcurrency()">批量调并发</button>
-            <button class="danger" type="button" onclick="bulkDeleteKeys()">批量删除</button>
+            <button class="secondary" type="button" onclick="selectAllKeys()">批量全部</button>
             <button type="button" onclick="openKeyDialog()">新增 Key</button>
+          </div>
+        </div>
+        <div id="bulkSelectionBar" class="bulk-selection-bar hidden">
+          <div class="bulk-selection-copy">
+            <strong id="bulkSelectionTitle">已选 0 个 Key</strong>
+            <span id="bulkSelectionMeta">批量操作只会影响当前选中的 Key</span>
+          </div>
+          <div class="bulk-actions">
+            <button id="bulkSelectAllButton" class="ghost" type="button" onclick="selectAllKeys()">选择全部 Key</button>
+            <button class="ghost" type="button" onclick="clearBulkSelection()">清空选择</button>
+            <button class="secondary" type="button" onclick="openBulkConcurrencyDialog()">调整并发</button>
+            <button class="danger" type="button" onclick="openBulkDeleteDialog()">删除选中</button>
           </div>
         </div>
         <div class="table-wrap">
@@ -509,6 +687,7 @@
                 <th>代理覆盖</th>
                 <th>状态</th>
                 <th>并发</th>
+                <th>首字响应</th>
                 <th>错误</th>
                 <th>最后使用</th>
                 <th style="text-align:right">操作</th>
@@ -523,6 +702,34 @@
           <div class="pager-actions">
             <button class="secondary" id="prevPageButton" type="button" onclick="prevPage()">上一页</button>
             <button class="secondary" id="nextPageButton" type="button" onclick="nextPage()">下一页</button>
+          </div>
+        </div>
+        </section>
+      </div>
+
+      <section id="monitorView" class="panel hidden">
+        <div class="panel-header">
+          <h2>监控</h2>
+          <div class="monitor-toolbar">
+            <span class="muted" id="monitorUpdatedAt">未加载</span>
+            <div class="segmented" aria-label="监控粒度">
+              <button id="granularityMinute" class="active" type="button" onclick="changeMetricsGranularity('minute')">分</button>
+              <button id="granularityHour" type="button" onclick="changeMetricsGranularity('hour')">时</button>
+              <button id="granularityDay" type="button" onclick="changeMetricsGranularity('day')">天</button>
+            </div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="chart-legend">
+            <span class="legend-item"><i class="legend-swatch" style="--legend-color:#2563eb"></i>首字响应 ms</span>
+            <span class="legend-item"><i class="legend-swatch" style="--legend-color:#0f766e"></i>并发数</span>
+            <span class="legend-item"><i class="legend-swatch" style="--legend-color:#b42318"></i>错误数</span>
+            <span class="muted">三条线分泳道展示，避免毫秒值压扁并发/错误</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="monitorChart"></canvas>
+            <div id="monitorEmpty" class="chart-empty hidden">暂无最近 7 天监控数据</div>
+            <div id="monitorTooltip" class="chart-tooltip hidden"></div>
           </div>
         </div>
       </section>
@@ -604,6 +811,42 @@
     </form>
   </dialog>
 
+  <dialog id="bulkConcurrencyDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2>调整批量并发</h2>
+        <button class="ghost" type="button" onclick="bulkConcurrencyDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <p class="muted" id="bulkConcurrencyTarget">将调整选中的 Key</p>
+        <label>最大并发
+          <input id="bulkMaxConcurrency" type="number" min="1" value="1">
+        </label>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" type="button" onclick="bulkConcurrencyDialog.close()">取消</button>
+        <button id="bulkConcurrencyButton" type="button" onclick="bulkUpdateConcurrency()">确认调整</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="bulkDeleteDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2>确认删除 Key</h2>
+        <button class="ghost" type="button" onclick="bulkDeleteDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <div class="danger-copy" id="bulkDeleteMessage">即将删除选中的 Key，此操作不可恢复。</div>
+        <p class="muted">请确认目标范围无误。删除后需要重新导入 Key 才能恢复。</p>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" id="bulkDeleteCancelButton" type="button" onclick="bulkDeleteDialog.close()">取消</button>
+        <button class="danger" id="bulkDeleteButton" type="button" onclick="bulkDeleteKeys()">确认删除</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="captureDialog">
     <div class="dialog-head">
       <h2>最后一次请求与响应</h2>
@@ -655,6 +898,11 @@
     let sortBy = "default";
     let sortOrder = "desc";
     let testingId = "";
+    let allKeysSelected = false;
+    let activeTab = "keys";
+    let metricsGranularity = "minute";
+    let metricItems = [];
+    let chartHitPoints = [];
     const selectedKeyIds = new Set();
 
     const el = id => document.getElementById(id);
@@ -696,7 +944,9 @@
       el("appView").classList.remove("hidden");
       window.clearInterval(refreshTimer);
       refreshTimer = window.setInterval(() => {
-        if (!el("appView").classList.contains("hidden")) loadAll(false);
+        if (el("appView").classList.contains("hidden")) return;
+        if (activeTab === "monitor") loadMetrics(false);
+        else loadAll(false);
       }, 5000);
     }
 
@@ -757,6 +1007,45 @@
       }
     }
 
+    function switchAdminTab(tab) {
+      activeTab = tab === "monitor" ? "monitor" : "keys";
+      el("keysTabButton").classList.toggle("active", activeTab === "keys");
+      el("monitorTabButton").classList.toggle("active", activeTab === "monitor");
+      el("keyManagementView").classList.toggle("hidden", activeTab !== "keys");
+      el("monitorView").classList.toggle("hidden", activeTab !== "monitor");
+      if (activeTab === "monitor") loadMetrics(false);
+    }
+
+    function refreshActiveView() {
+      if (activeTab === "monitor") loadMetrics(true);
+      else loadAll(true);
+    }
+
+    function changeMetricsGranularity(granularity) {
+      metricsGranularity = granularity;
+      ["minute", "hour", "day"].forEach(name => {
+        const button = el(`granularity${name[0].toUpperCase()}${name.slice(1)}`);
+        if (button) button.classList.toggle("active", name === metricsGranularity);
+      });
+      loadMetrics(false);
+    }
+
+    async function loadMetrics(showToast = false) {
+      try {
+        const data = await api(`/api/admin/metrics?granularity=${encodeURIComponent(metricsGranularity)}`);
+        metricItems = data.items || [];
+        el("monitorUpdatedAt").textContent = `最近刷新：${formatDateTime(new Date().toISOString())}`;
+        renderMetricsChart();
+        if (showToast) toast("监控已加载");
+      } catch (e) {
+        if (e.status === 401) {
+          showLogin();
+          return;
+        }
+        toast(e.message, "error");
+      }
+    }
+
     function openConfigDialog() {
       configDialog.showModal();
     }
@@ -794,12 +1083,14 @@
       pageSize = Number(value("pageSize") || "100");
       if (pageSize > 1000) pageSize = 1000;
       page = 1;
+      allKeysSelected = false;
       loadAll(false);
     }
 
     function changeStatusFilter() {
       statusFilter = value("statusFilter") || "all";
       page = 1;
+      allKeysSelected = false;
       loadAll(false);
     }
 
@@ -808,18 +1099,21 @@
       sortBy = nextSort || "default";
       sortOrder = nextOrder || "desc";
       page = 1;
+      allKeysSelected = false;
       loadAll(false);
     }
 
     function prevPage() {
       if (page <= 1) return;
       page--;
+      allKeysSelected = false;
       loadAll(false);
     }
 
     function nextPage() {
       if (totalPages > 0 && page >= totalPages) return;
       page++;
+      allKeysSelected = false;
       loadAll(false);
     }
 
@@ -915,14 +1209,36 @@
       }
     }
 
+    function selectedTargetCount() {
+      return allKeysSelected ? allTargetCount() : selectedKeyIds.size;
+    }
+
+    function allTargetCount() {
+      return stats.total || total || 0;
+    }
+
     function bulkTargetPayload() {
-      const all = value("bulkScope") === "all";
+      const all = allKeysSelected;
       const ids = all ? [] : Array.from(selectedKeyIds);
       if (!all && ids.length === 0) {
-        toast("请先选择 Key，或将范围切换为全部", "error");
+        toast("请先选择 Key", "error");
         return null;
       }
       return { all, ids };
+    }
+
+    function bulkTargetLabel(target = bulkTargetPayload()) {
+      if (!target) return "";
+      return target.all ? `全部 ${allTargetCount()} 个 Key` : `选中的 ${target.ids.length} 个 Key`;
+    }
+
+    function openBulkConcurrencyDialog() {
+      const target = bulkTargetPayload();
+      if (!target) return;
+      el("bulkConcurrencyTarget").textContent = `将调整${bulkTargetLabel(target)}的最大并发`;
+      setValue("bulkMaxConcurrency", "1");
+      bulkConcurrencyDialog.showModal();
+      setTimeout(() => el("bulkMaxConcurrency").focus(), 0);
     }
 
     async function bulkUpdateConcurrency() {
@@ -933,35 +1249,49 @@
         toast("并发必须大于 0", "error");
         return;
       }
-      const label = target.all ? "全部 Key" : `选中的 ${target.ids.length} 个 Key`;
-      if (!confirm(`确认把${label}的最大并发调整为 ${maxConcurrency}？`)) return;
+      el("bulkConcurrencyButton").disabled = true;
       try {
         const result = await api("/api/admin/keys/concurrency", {
           method: "POST",
           body: JSON.stringify({ ...target, maxConcurrency })
         });
+        bulkConcurrencyDialog.close();
+        clearBulkSelection(false);
         await loadAll(false);
         toast(`已调整 ${result.updated || 0} 个 Key`);
       } catch (e) {
         toast(e.message, "error");
+      } finally {
+        el("bulkConcurrencyButton").disabled = false;
       }
+    }
+
+    function openBulkDeleteDialog() {
+      const target = bulkTargetPayload();
+      if (!target) return;
+      const label = bulkTargetLabel(target);
+      el("bulkDeleteMessage").textContent = `即将删除${label}，此操作不可恢复。`;
+      bulkDeleteDialog.showModal();
+      setTimeout(() => el("bulkDeleteCancelButton").focus(), 0);
     }
 
     async function bulkDeleteKeys() {
       const target = bulkTargetPayload();
       if (!target) return;
-      const label = target.all ? "全部 Key" : `选中的 ${target.ids.length} 个 Key`;
-      if (!confirm(`确认删除${label}？这个操作不可恢复。`)) return;
+      el("bulkDeleteButton").disabled = true;
       try {
         const result = await api("/api/admin/keys/delete", {
           method: "POST",
           body: JSON.stringify(target)
         });
-        selectedKeyIds.clear();
+        bulkDeleteDialog.close();
+        clearBulkSelection(false);
         await loadAll(false);
         toast(`已删除 ${result.deleted || 0} 个 Key`);
       } catch (e) {
         toast(e.message, "error");
+      } finally {
+        el("bulkDeleteButton").disabled = false;
       }
     }
 
@@ -970,6 +1300,7 @@
       try {
         await api(`/api/admin/keys/${id}`, { method: "DELETE" });
         selectedKeyIds.delete(id);
+        allKeysSelected = false;
         await loadAll(false);
         toast("已删除");
       } catch (e) {
@@ -1196,13 +1527,14 @@
       el("nextPageButton").disabled = totalPages === 0 || page >= totalPages;
       el("keysTable").innerHTML = keys.map(k => `
         <tr>
-          <td><input type="checkbox" ${selectedKeyIds.has(k.id) ? "checked" : ""} onchange="toggleKeySelection('${k.id}', this.checked)" aria-label="选择 ${escapeHtml(k.name)}"></td>
+          <td><input type="checkbox" ${allKeysSelected || selectedKeyIds.has(k.id) ? "checked" : ""} onchange="toggleKeySelection('${k.id}', this.checked)" aria-label="选择 ${escapeHtml(k.name)}"></td>
           <td><strong>${escapeHtml(k.name)}</strong></td>
           <td class="mono">${maskKey(k.apiKey)}</td>
           <td class="truncate">${escapeHtml(k.baseUrl || "使用全局")}</td>
           <td class="truncate">${escapeHtml(k.proxyUrl || "使用全局")}</td>
           <td>${statusPill(k)}</td>
           <td>${k.currentConcurrency || 0}/${k.maxConcurrency}</td>
+          <td>${formatFirstByte(k.lastFirstByteMs)}</td>
           <td><span>${k.consecutiveErrors || 0}</span>${k.lastError ? `<div class="muted truncate">${escapeHtml(k.lastError)}</div>` : ""}</td>
           <td>${formatDateTime(k.lastUsedAt)}</td>
           <td>
@@ -1217,15 +1549,19 @@
         </tr>
       `).join("");
       updatePageSelectionState();
+      updateBulkSelectionBar();
     }
 
     function toggleKeySelection(id, checked) {
+      allKeysSelected = false;
       if (checked) selectedKeyIds.add(id);
       else selectedKeyIds.delete(id);
       updatePageSelectionState();
+      updateBulkSelectionBar();
     }
 
     function togglePageSelection(checked) {
+      allKeysSelected = false;
       keys.forEach(k => {
         if (checked) selectedKeyIds.add(k.id);
         else selectedKeyIds.delete(k.id);
@@ -1233,13 +1569,44 @@
       render();
     }
 
+    function selectAllKeys() {
+      if (allTargetCount() <= 0) return;
+      selectedKeyIds.clear();
+      allKeysSelected = true;
+      render();
+    }
+
+    function clearBulkSelection(renderNow = true) {
+      selectedKeyIds.clear();
+      allKeysSelected = false;
+      if (renderNow) render();
+    }
+
     function updatePageSelectionState() {
       const checkbox = el("selectPageKeys");
       if (!checkbox) return;
       const visible = keys.map(k => k.id);
-      const selected = visible.filter(id => selectedKeyIds.has(id)).length;
+      const selected = allKeysSelected ? visible.length : visible.filter(id => selectedKeyIds.has(id)).length;
       checkbox.checked = visible.length > 0 && selected === visible.length;
       checkbox.indeterminate = selected > 0 && selected < visible.length;
+    }
+
+    function updateBulkSelectionBar() {
+      const count = selectedTargetCount();
+      const bar = el("bulkSelectionBar");
+      bar.classList.toggle("hidden", count === 0);
+      if (count === 0) return;
+      el("bulkSelectionTitle").textContent = allKeysSelected
+        ? `已选择全部 ${allTargetCount()} 个 Key`
+        : `已选 ${count} 个 Key`;
+      el("bulkSelectionMeta").textContent = allKeysSelected
+        ? "接下来的批量操作会影响库里的全部 Key，包含当前筛选外的 Key"
+        : "接下来的批量操作只会影响已勾选的 Key";
+      const selectAllButton = el("bulkSelectAllButton");
+      selectAllButton.classList.toggle("hidden", allKeysSelected || allTargetCount() <= 0);
+      selectAllButton.textContent = count > 0
+        ? `改为全部 ${allTargetCount()} 个 Key`
+        : `选择全部 ${allTargetCount()} 个 Key`;
     }
 
     function statusPill(k) {
@@ -1247,6 +1614,206 @@
       if (k.balanceDepleted) return `<span class="pill bad">余额不足</span>`;
       if (k.paused) return `<span class="pill bad">暂停</span>`;
       return `<span class="pill">可用</span>`;
+    }
+
+    function renderMetricsChart() {
+      const canvas = el("monitorChart");
+      const empty = el("monitorEmpty");
+      if (!canvas) return;
+      hideMonitorTooltip();
+      const points = [...metricItems].sort((a, b) => new Date(a.time) - new Date(b.time));
+      chartHitPoints = [];
+      empty.classList.toggle("hidden", points.length > 0);
+
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(640, Math.floor(canvas.clientWidth || 640));
+      const height = Math.max(320, Math.floor(canvas.clientHeight || 360));
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      const pad = { top: 18, right: 18, bottom: 40, left: 72 };
+      const plotWidth = width - pad.left - pad.right;
+      const plotHeight = height - pad.top - pad.bottom;
+      const series = [
+        { key: "firstByteMs", label: "首字响应", unit: "ms", color: "#2563eb", empty: true },
+        { key: "concurrency", label: "并发数", unit: "", color: "#0f766e" },
+        { key: "errors", label: "错误数", unit: "", color: "#b42318" }
+      ];
+      const lanes = buildChartLanes(series, pad, plotHeight, points);
+
+      drawChartGrid(ctx, width, height, pad, plotWidth, lanes, points);
+      if (points.length === 0) return;
+      lanes.forEach(lane => drawMetricSeries(ctx, points, lane, pad, plotWidth));
+    }
+
+    function buildChartLanes(series, pad, plotHeight, points) {
+      const gap = 22;
+      const laneHeight = (plotHeight - gap * (series.length - 1)) / series.length;
+      return series.map((item, index) => {
+        const values = points
+          .map(point => Number(point[item.key]))
+          .filter(value => Number.isFinite(value));
+        return {
+          ...item,
+          top: pad.top + index * (laneHeight + gap),
+          height: laneHeight,
+          scaleMax: Math.max(1, ...values)
+        };
+      });
+    }
+
+    function drawChartGrid(ctx, width, height, pad, plotWidth, lanes, points) {
+      ctx.lineWidth = 1;
+      ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      lanes.forEach(lane => {
+        ctx.strokeStyle = "#e5eaf1";
+        for (let i = 0; i <= 2; i++) {
+          const y = lane.top + (lane.height * i / 2);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(width - pad.right, y);
+          ctx.stroke();
+        }
+        ctx.strokeStyle = "#c5cedb";
+        ctx.beginPath();
+        ctx.rect(pad.left, lane.top, plotWidth, lane.height);
+        ctx.stroke();
+
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = lane.color;
+        ctx.fillText(lane.label, pad.left - 10, lane.top + lane.height / 2);
+        ctx.fillStyle = "#667085";
+        ctx.fillText(formatLaneValue(lane.scaleMax, lane.unit), pad.left - 10, lane.top + 10);
+        ctx.fillText("0", pad.left - 10, lane.top + lane.height - 8);
+      });
+
+      if (points.length === 0) return;
+      ctx.fillStyle = "#667085";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const labels = chartTimeLabels(points);
+      labels.forEach(label => {
+        ctx.fillText(label.text, pad.left + plotWidth * label.ratio, height - pad.bottom + 12);
+      });
+    }
+
+    function drawMetricSeries(ctx, points, lane, pad, plotWidth) {
+      ctx.strokeStyle = lane.color;
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      let started = false;
+      const dots = [];
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const raw = point[lane.key];
+        if (lane.empty && !Number.isFinite(Number(raw))) {
+          started = false;
+          return;
+        }
+        const value = Number(raw || 0);
+        const x = pad.left + (points.length === 1 ? plotWidth / 2 : plotWidth * index / (points.length - 1));
+        const y = lane.top + lane.height - (Math.min(value, lane.scaleMax) / lane.scaleMax * lane.height);
+        dots.push({ x, y });
+        addChartHitPoint(point, index, x);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+      dots.forEach(dot => {
+        ctx.beginPath();
+        ctx.fillStyle = lane.color;
+        ctx.arc(dot.x, dot.y, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function addChartHitPoint(point, index, x) {
+      if (!chartHitPoints[index]) chartHitPoints[index] = { point, x };
+    }
+
+    function formatLaneValue(value, unit) {
+      const rounded = value >= 100 ? Math.round(value) : Number(value.toFixed(1));
+      return unit ? `${rounded} ${unit}` : String(rounded);
+    }
+
+    function showMonitorTooltip(event) {
+      if (!chartHitPoints.length) return hideMonitorTooltip();
+      const canvas = el("monitorChart");
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      let nearest = null;
+      let distance = Infinity;
+      chartHitPoints.forEach(hit => {
+        if (!hit) return;
+        const nextDistance = Math.abs(hit.x - mouseX);
+        if (nextDistance < distance) {
+          nearest = hit;
+          distance = nextDistance;
+        }
+      });
+      if (!nearest || distance > 48) return hideMonitorTooltip();
+
+      const point = nearest.point;
+      const tooltip = el("monitorTooltip");
+      tooltip.innerHTML = `
+        <strong>${escapeHtml(formatTooltipTime(point.time))}</strong>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#2563eb"></i>首字响应</span><b>${formatTooltipValue(point.firstByteMs, "ms")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#0f766e"></i>并发数</span><b>${formatTooltipValue(point.concurrency, "")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#b42318"></i>错误数</span><b>${formatTooltipValue(point.errors, "")}</b></div>
+        <div class="tip-row"><span class="tip-label">请求数</span><b>${formatTooltipValue(point.requests, "")}</b></div>
+      `;
+      tooltip.classList.remove("hidden");
+      const left = Math.min(Math.max(nearest.x + 12, 95), rect.width - 95);
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${event.clientY - rect.top}px`;
+    }
+
+    function hideMonitorTooltip() {
+      const tooltip = el("monitorTooltip");
+      if (tooltip) tooltip.classList.add("hidden");
+    }
+
+    function formatTooltipValue(value, unit) {
+      if (!Number.isFinite(Number(value))) return "-";
+      const rounded = Math.round(Number(value));
+      return unit ? `${rounded} ${unit}` : String(rounded);
+    }
+
+    function formatTooltipTime(value) {
+      return new Date(value).toLocaleString();
+    }
+
+    function chartTimeLabels(points) {
+      const first = points[0];
+      const last = points[points.length - 1];
+      if (points.length === 1) {
+        return [{ ratio: 0.5, text: formatChartTime(first.time) }];
+      }
+      return [
+        { ratio: 0, text: formatChartTime(first.time) },
+        { ratio: 1, text: formatChartTime(last.time) }
+      ];
+    }
+
+    function formatChartTime(value) {
+      const date = new Date(value);
+      if (metricsGranularity === "day") return date.toLocaleDateString();
+      if (metricsGranularity === "hour") return `${date.toLocaleDateString()} ${String(date.getHours()).padStart(2, "0")}:00`;
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function formatFirstByte(value) {
+      if (!Number.isFinite(Number(value))) return "<span class=\"muted\">-</span>";
+      return `${Math.round(Number(value))} ms`;
     }
 
     function formatDateTime(value) {
@@ -1265,6 +1832,11 @@
     }
 
     el("loginForm").addEventListener("submit", login);
+    el("monitorChart").addEventListener("mousemove", showMonitorTooltip);
+    el("monitorChart").addEventListener("mouseleave", hideMonitorTooltip);
+    window.addEventListener("resize", () => {
+      if (activeTab === "monitor") renderMetricsChart();
+    });
     loadAll(false).then(ok => ok ? showApp() : showLogin()).catch(showLogin);
   </script>
 </body>

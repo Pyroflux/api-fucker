@@ -204,6 +204,55 @@ func TestBulkActionsRequireSelectionUnlessAll(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpoint(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+
+	firstByte := int64(88)
+	if err := h.store.RecordMetric("", store.MetricSample{Time: time.Now().UTC(), FirstByteMS: &firstByte, Concurrency: 2, Error: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := adminGet(h, "/api/admin/metrics?granularity=minute")
+	if res.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d body = %s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Items []store.MetricPoint `json:"items"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].FirstByteMS == nil || *body.Items[0].FirstByteMS != 88 || body.Items[0].Errors != 1 {
+		t.Fatalf("unexpected metrics response: %+v", body)
+	}
+}
+
+func TestMetricsEndpointIncludesLiveConcurrency(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := New(st, "token", func() map[string]int {
+		return map[string]int{"a": 1, "b": 2}
+	})
+
+	res := adminGet(h, "/api/admin/metrics?granularity=minute")
+	if res.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d body = %s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Items []store.MetricPoint `json:"items"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].Concurrency != 3 || body.Items[0].Requests != 0 {
+		t.Fatalf("unexpected live metrics response: %+v", body)
+	}
+}
+
 func TestKeyModelsAndTestActions(t *testing.T) {
 	h, closeStore := newTestHandler(t, "token")
 	defer closeStore()
