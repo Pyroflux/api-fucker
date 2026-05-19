@@ -24,11 +24,13 @@ if [[ ! -f "$VPS_FILE" ]]; then
   exit 1
 fi
 
-while IFS= read -r host; do
+deployed=0
+while IFS= read -r host || [[ -n "$host" ]]; do
   [[ -z "$host" || "$host" =~ ^[[:space:]]*# ]] && continue
   host="${host%%#*}"
   host="$(echo "$host" | xargs)"
   [[ -z "$host" ]] && continue
+  deployed=$((deployed + 1))
 
   echo "==> deploying to $host"
   # shellcheck disable=SC2086
@@ -39,18 +41,26 @@ while IFS= read -r host; do
     "SERVER_URL='$SERVER_URL' PROXY_NODE_TOKEN='$PROXY_NODE_TOKEN' LISTEN_ADDR='$LISTEN_ADDR' MAX_CONCURRENCY='$MAX_CONCURRENCY' REMOTE_BIN='$REMOTE_BIN' SERVICE_NAME='$SERVICE_NAME' bash -s" <<'REMOTE'
 set -euo pipefail
 
-install -m 0755 /tmp/api-fucker-proxy "$REMOTE_BIN"
+SUDO=""
+if [[ "$(id -u)" != "0" ]]; then
+  SUDO="sudo"
+fi
 
-mkdir -p /etc/api-fucker-proxy
-cat > /etc/api-fucker-proxy/proxy.env <<EOF
+$SUDO install -m 0755 /tmp/api-fucker-proxy "$REMOTE_BIN"
+
+$SUDO mkdir -p /etc/api-fucker-proxy
+tmp_env="$(mktemp)"
+cat > "$tmp_env" <<EOF
 SERVER_URL=${SERVER_URL}
 PROXY_NODE_TOKEN=${PROXY_NODE_TOKEN}
 LISTEN_ADDR=${LISTEN_ADDR}
 MAX_CONCURRENCY=${MAX_CONCURRENCY}
 EOF
-chmod 600 /etc/api-fucker-proxy/proxy.env
+$SUDO install -m 0600 "$tmp_env" /etc/api-fucker-proxy/proxy.env
+rm -f "$tmp_env"
 
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+tmp_service="$(mktemp)"
+cat > "$tmp_service" <<EOF
 [Unit]
 Description=api-fucker VPS Proxy Client
 After=network-online.target
@@ -75,17 +85,24 @@ ReadWritePaths=/var/lib/api-fucker-proxy
 [Install]
 WantedBy=multi-user.target
 EOF
+$SUDO install -m 0644 "$tmp_service" "/etc/systemd/system/${SERVICE_NAME}.service"
+rm -f "$tmp_service"
 
-systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
-systemctl restart "$SERVICE_NAME"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable --now "$SERVICE_NAME"
+$SUDO systemctl restart "$SERVICE_NAME"
 
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 9070/tcp >/dev/null || true
+  $SUDO ufw allow 9070/tcp >/dev/null || true
 fi
 
-systemctl --no-pager --full status "$SERVICE_NAME" | sed -n '1,12p'
+$SUDO systemctl --no-pager --full status "$SERVICE_NAME" | sed -n '1,12p'
 REMOTE
 
   echo "==> done $host"
 done < "$VPS_FILE"
+
+if [[ "$deployed" -eq 0 ]]; then
+  echo "no VPS hosts found in $VPS_FILE" >&2
+  exit 1
+fi
