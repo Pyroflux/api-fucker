@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -15,12 +16,17 @@ import (
 )
 
 const (
-	keysBucket     = "keys"
-	metaBucket     = "meta"
-	captureBucket  = "captures"
-	metricsBucket  = "metrics"
-	globalConfigID = "global"
-	metricsMaxAge  = 7 * 24 * time.Hour
+	keysBucket       = "keys"
+	metaBucket       = "meta"
+	captureBucket    = "captures"
+	metricsBucket    = "metrics"
+	proxyNodesBucket = "proxy_nodes"
+	globalConfigID   = "global"
+	metricsMaxAge    = 7 * 24 * time.Hour
+
+	ProxyModeRoundRobin  = "round_robin"
+	ProxyModeKeyBinding  = "key_binding"
+	ProxyNodeOnlineAfter = 30 * time.Second
 )
 
 var (
@@ -32,11 +38,13 @@ type Store struct {
 }
 
 type GlobalConfig struct {
-	UpstreamBaseURL string    `json:"upstreamBaseUrl"`
-	DefaultProxyURL string    `json:"defaultProxyUrl"`
-	IPAllowlist     []string  `json:"ipAllowlist,omitempty"`
-	IPBlocklist     []string  `json:"ipBlocklist,omitempty"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	UpstreamBaseURL  string    `json:"upstreamBaseUrl"`
+	DefaultProxyURL  string    `json:"defaultProxyUrl"`
+	IPAllowlist      []string  `json:"ipAllowlist,omitempty"`
+	IPBlocklist      []string  `json:"ipBlocklist,omitempty"`
+	ProxyPoolEnabled bool      `json:"proxyPoolEnabled"`
+	ProxyMode        string    `json:"proxyMode"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 type Key struct {
@@ -83,6 +91,49 @@ type BulkUpdateResult struct {
 
 type BulkDeleteResult struct {
 	Deleted int `json:"deleted"`
+}
+
+type ProxyNode struct {
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	ProxyURL           string    `json:"proxyUrl"`
+	Enabled            bool      `json:"enabled"`
+	MaxConcurrency     int       `json:"maxConcurrency"`
+	LastReportAt       time.Time `json:"lastReportAt"`
+	LastRemoteAddr     string    `json:"lastRemoteAddr"`
+	Version            string    `json:"version"`
+	StartedAt          time.Time `json:"startedAt"`
+	ListenAddr         string    `json:"listenAddr"`
+	CurrentConnections int       `json:"currentConnections"`
+	TotalRequests      int64     `json:"totalRequests"`
+	FailedRequests     int64     `json:"failedRequests"`
+	BytesIn            int64     `json:"bytesIn"`
+	BytesOut           int64     `json:"bytesOut"`
+	LastError          string    `json:"lastError"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+}
+
+type ProxyNodeView struct {
+	ProxyNode
+	Online bool   `json:"online"`
+	Status string `json:"status"`
+}
+
+type ProxyNodeReport struct {
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	ProxyURL           string    `json:"proxyUrl"`
+	ListenAddr         string    `json:"listenAddr"`
+	Version            string    `json:"version"`
+	StartedAt          time.Time `json:"startedAt"`
+	CurrentConnections int       `json:"currentConnections"`
+	TotalRequests      int64     `json:"totalRequests"`
+	FailedRequests     int64     `json:"failedRequests"`
+	BytesIn            int64     `json:"bytesIn"`
+	BytesOut           int64     `json:"bytesOut"`
+	MaxConcurrency     int       `json:"maxConcurrency"`
+	LastError          string    `json:"lastError"`
 }
 
 type MetricSample struct {
@@ -164,6 +215,9 @@ func (s *Store) init() error {
 		if _, err := tx.CreateBucketIfNotExists([]byte(metricsBucket)); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists([]byte(proxyNodesBucket)); err != nil {
+			return err
+		}
 		b := tx.Bucket([]byte(metaBucket))
 		if b.Get([]byte(globalConfigID)) == nil {
 			cfg := GlobalConfig{UpdatedAt: time.Now().UTC()}
@@ -196,6 +250,7 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 	if err := validateOptionalURL(cfg.DefaultProxyURL, "default proxy URL"); err != nil {
 		return err
 	}
+	cfg.ProxyMode = normalizeProxyMode(cfg.ProxyMode)
 	cfg.IPAllowlist = normalizeRules(cfg.IPAllowlist)
 	cfg.IPBlocklist = normalizeRules(cfg.IPBlocklist)
 	cfg.UpdatedAt = time.Now().UTC()
@@ -206,6 +261,15 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 		}
 		return tx.Bucket([]byte(metaBucket)).Put([]byte(globalConfigID), raw)
 	})
+}
+
+func normalizeProxyMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case ProxyModeKeyBinding:
+		return ProxyModeKeyBinding
+	default:
+		return ProxyModeRoundRobin
+	}
 }
 
 func normalizeRules(values []string) []string {
@@ -665,6 +729,200 @@ func (s *Store) GetCapture(keyID string) (Capture, error) {
 	return c, err
 }
 
+func (s *Store) ListProxyNodes(now time.Time) ([]ProxyNodeView, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nodes := make([]ProxyNodeView, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(proxyNodesBucket)).ForEach(func(_, raw []byte) error {
+			var node ProxyNode
+			if err := json.Unmarshal(raw, &node); err != nil {
+				return err
+			}
+			nodes = append(nodes, proxyNodeView(node, now))
+			return nil
+		})
+	})
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+	return nodes, err
+}
+
+func (s *Store) GetProxyNode(id string) (ProxyNode, error) {
+	var node ProxyNode
+	err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket([]byte(proxyNodesBucket)).Get([]byte(id))
+		if raw == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(raw, &node)
+	})
+	return node, err
+}
+
+func (s *Store) UpsertProxyNodeReport(report ProxyNodeReport, remoteAddr string) (ProxyNode, error) {
+	report.ID = strings.TrimSpace(report.ID)
+	if report.ID == "" {
+		return ProxyNode{}, fmt.Errorf("proxy node id is required")
+	}
+	now := time.Now().UTC()
+	var node ProxyNode
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(proxyNodesBucket))
+		raw := b.Get([]byte(report.ID))
+		if raw == nil {
+			node = ProxyNode{
+				ID:             report.ID,
+				Name:           strings.TrimSpace(report.Name),
+				Enabled:        true,
+				MaxConcurrency: 100,
+				CreatedAt:      now,
+			}
+			if node.Name == "" {
+				node.Name = node.ID
+			}
+			if report.MaxConcurrency > 0 {
+				node.MaxConcurrency = report.MaxConcurrency
+			}
+		} else if err := json.Unmarshal(raw, &node); err != nil {
+			return err
+		}
+
+		if name := strings.TrimSpace(report.Name); name != "" {
+			node.Name = name
+		}
+		node.ProxyURL = strings.TrimSpace(report.ProxyURL)
+		if node.ProxyURL == "" {
+			node.ProxyURL = deriveProxyURL(remoteAddr, report.ListenAddr)
+		}
+		node.ListenAddr = strings.TrimSpace(report.ListenAddr)
+		node.Version = strings.TrimSpace(report.Version)
+		node.StartedAt = report.StartedAt.UTC()
+		node.LastReportAt = now
+		node.LastRemoteAddr = remoteHost(remoteAddr)
+		node.CurrentConnections = nonNegativeInt(report.CurrentConnections)
+		node.TotalRequests = nonNegativeInt64(report.TotalRequests)
+		node.FailedRequests = nonNegativeInt64(report.FailedRequests)
+		node.BytesIn = nonNegativeInt64(report.BytesIn)
+		node.BytesOut = nonNegativeInt64(report.BytesOut)
+		node.LastError = strings.TrimSpace(report.LastError)
+		node.UpdatedAt = now
+		if node.MaxConcurrency <= 0 {
+			node.MaxConcurrency = 100
+		}
+		if err := ValidateProxyNode(node); err != nil {
+			return err
+		}
+		next, err := json.Marshal(node)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(node.ID), next)
+	})
+	return node, err
+}
+
+func (s *Store) UpdateProxyNode(id string, patch ProxyNode) (ProxyNode, error) {
+	var node ProxyNode
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(proxyNodesBucket))
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return err
+		}
+		node.Name = strings.TrimSpace(patch.Name)
+		node.ProxyURL = strings.TrimSpace(patch.ProxyURL)
+		node.Enabled = patch.Enabled
+		node.MaxConcurrency = patch.MaxConcurrency
+		if node.Name == "" {
+			node.Name = node.ID
+		}
+		if node.MaxConcurrency <= 0 {
+			node.MaxConcurrency = 100
+		}
+		node.UpdatedAt = time.Now().UTC()
+		if err := ValidateProxyNode(node); err != nil {
+			return err
+		}
+		next, err := json.Marshal(node)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(id), next)
+	})
+	return node, err
+}
+
+func (s *Store) DeleteProxyNode(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(proxyNodesBucket)).Delete([]byte(id))
+	})
+}
+
+func proxyNodeView(node ProxyNode, now time.Time) ProxyNodeView {
+	online := !node.LastReportAt.IsZero() && now.UTC().Sub(node.LastReportAt.UTC()) <= ProxyNodeOnlineAfter
+	status := "offline"
+	if !node.Enabled {
+		status = "disabled"
+	} else if online {
+		status = "online"
+	}
+	return ProxyNodeView{ProxyNode: node, Online: online, Status: status}
+}
+
+func deriveProxyURL(remoteAddr, listenAddr string) string {
+	host := remoteHost(remoteAddr)
+	port := listenPort(listenAddr)
+	if host == "" || port == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+func remoteHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+}
+
+func listenPort(listenAddr string) string {
+	listenAddr = strings.TrimSpace(listenAddr)
+	if listenAddr == "" {
+		return "9070"
+	}
+	if _, port, err := net.SplitHostPort(listenAddr); err == nil {
+		return port
+	}
+	if strings.HasPrefix(listenAddr, ":") {
+		return strings.TrimPrefix(listenAddr, ":")
+	}
+	if strings.IndexByte(listenAddr, ':') < 0 {
+		return listenAddr
+	}
+	return ""
+}
+
+func nonNegativeInt(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func nonNegativeInt64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 func updateKeyFirstByte(tx *bolt.Tx, id string, firstByteMS int64, now time.Time) error {
 	b := tx.Bucket([]byte(keysBucket))
 	raw := b.Get([]byte(id))
@@ -751,6 +1009,35 @@ func ValidateKey(key Key) error {
 		return fmt.Errorf("max concurrency must be greater than zero")
 	}
 	return nil
+}
+
+func ValidateProxyNode(node ProxyNode) error {
+	if strings.TrimSpace(node.ID) == "" {
+		return fmt.Errorf("proxy node id is required")
+	}
+	if !validProxyNodeID(node.ID) {
+		return fmt.Errorf("proxy node id may only contain letters, numbers, dot, underscore, and dash")
+	}
+	if strings.TrimSpace(node.Name) == "" {
+		return fmt.Errorf("proxy node name is required")
+	}
+	if err := validateOptionalURL(node.ProxyURL, "proxy URL"); err != nil {
+		return err
+	}
+	if node.MaxConcurrency <= 0 {
+		return fmt.Errorf("max concurrency must be greater than zero")
+	}
+	return nil
+}
+
+func validProxyNodeID(id string) bool {
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateRequiredURL(value, name string) error {

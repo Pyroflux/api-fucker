@@ -619,6 +619,7 @@
     <main class="page">
       <div class="view-tabs" aria-label="后台页面">
         <button id="keysTabButton" class="active" type="button" onclick="switchAdminTab('keys')">Key 管理</button>
+        <button id="proxiesTabButton" type="button" onclick="switchAdminTab('proxies')">代理管理</button>
         <button id="monitorTabButton" type="button" onclick="switchAdminTab('monitor')">监控</button>
       </div>
 
@@ -707,6 +708,43 @@
         </section>
       </div>
 
+      <div id="proxyManagementView" class="page-view hidden">
+        <section class="summary">
+          <div class="metric total"><span>代理总数</span><strong id="proxyMetricTotal">0</strong><small>全部</small></div>
+          <div class="metric healthy"><span>在线</span><strong id="proxyMetricOnline">0</strong><small>30 秒内上报</small></div>
+          <div class="metric paused"><span>停用</span><strong id="proxyMetricDisabled">0</strong><small>后台关闭</small></div>
+          <div class="metric inflight"><span>连接数</span><strong id="proxyMetricConnections">0</strong><small>客户端上报</small></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <h2>代理管理</h2>
+            <div class="toolbar">
+              <span class="muted">VPS 客户端默认每 10 秒上报一次</span>
+              <button class="secondary" type="button" onclick="loadProxies(true)">刷新代理</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>节点</th>
+                  <th>代理地址</th>
+                  <th>状态</th>
+                  <th>负载</th>
+                  <th>请求</th>
+                  <th>流量</th>
+                  <th>最后上报</th>
+                  <th>错误</th>
+                  <th style="text-align:right">操作</th>
+                </tr>
+              </thead>
+              <tbody id="proxiesTable"></tbody>
+            </table>
+            <div id="proxyEmptyState" class="empty hidden">暂无代理节点，启动 VPS 客户端后会自动注册</div>
+          </div>
+        </section>
+      </div>
+
       <section id="monitorView" class="panel hidden">
         <div class="panel-header">
           <h2>监控</h2>
@@ -750,6 +788,18 @@
           <label class="span-2">默认代理地址
             <input id="defaultProxyUrl" placeholder="http://127.0.0.1:7890">
           </label>
+          <label>VPS 代理池
+            <select id="proxyPoolEnabled">
+              <option value="false">关闭</option>
+              <option value="true">启用</option>
+            </select>
+          </label>
+          <label>代理模式
+            <select id="proxyMode">
+              <option value="round_robin">轮询</option>
+              <option value="key_binding">绑定 Key</option>
+            </select>
+          </label>
           <label class="span-2">请求 IP 白名单
             <textarea id="ipAllowlist" placeholder="为空表示不限制&#10;127.0.0.1&#10;192.*"></textarea>
           </label>
@@ -784,6 +834,27 @@
       <div class="dialog-foot">
         <button class="secondary" type="button" onclick="keyDialog.close()">取消</button>
         <button id="saveKeyButton" type="button" onclick="saveKey()">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="proxyDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2 id="proxyDialogTitle">编辑代理</h2>
+        <button class="ghost" type="button" onclick="proxyDialog.close()">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <div class="modal-grid">
+          <label>名称<input id="proxyName"></label>
+          <label>最大并发<input id="proxyMaxConcurrency" type="number" min="1" value="100"></label>
+          <label class="span-2">代理地址<input id="proxyNodeUrl" placeholder="http://1.2.3.4:9070"></label>
+          <label>启用<select id="proxyEnabled"><option value="true">启用</option><option value="false">停用</option></select></label>
+        </div>
+      </div>
+      <div class="dialog-foot">
+        <button class="secondary" type="button" onclick="proxyDialog.close()">取消</button>
+        <button id="saveProxyButton" type="button" onclick="saveProxy()">保存</button>
       </div>
     </form>
   </dialog>
@@ -903,6 +974,9 @@
     let metricsGranularity = "minute";
     let metricItems = [];
     let chartHitPoints = [];
+    let proxies = [];
+    let proxyStats = { total: 0, online: 0, disabled: 0, connections: 0 };
+    let editingProxyId = "";
     const selectedKeyIds = new Set();
 
     const el = id => document.getElementById(id);
@@ -946,6 +1020,7 @@
       refreshTimer = window.setInterval(() => {
         if (el("appView").classList.contains("hidden")) return;
         if (activeTab === "monitor") loadMetrics(false);
+        else if (activeTab === "proxies") loadProxies(false);
         else loadAll(false);
       }, 5000);
     }
@@ -1008,16 +1083,20 @@
     }
 
     function switchAdminTab(tab) {
-      activeTab = tab === "monitor" ? "monitor" : "keys";
+      activeTab = ["monitor", "proxies"].includes(tab) ? tab : "keys";
       el("keysTabButton").classList.toggle("active", activeTab === "keys");
+      el("proxiesTabButton").classList.toggle("active", activeTab === "proxies");
       el("monitorTabButton").classList.toggle("active", activeTab === "monitor");
       el("keyManagementView").classList.toggle("hidden", activeTab !== "keys");
+      el("proxyManagementView").classList.toggle("hidden", activeTab !== "proxies");
       el("monitorView").classList.toggle("hidden", activeTab !== "monitor");
       if (activeTab === "monitor") loadMetrics(false);
+      if (activeTab === "proxies") loadProxies(false);
     }
 
     function refreshActiveView() {
       if (activeTab === "monitor") loadMetrics(true);
+      else if (activeTab === "proxies") loadProxies(true);
       else loadAll(true);
     }
 
@@ -1053,6 +1132,8 @@
     function fillConfigForm(cfg) {
       setValue("upstreamBaseUrl", cfg.upstreamBaseUrl || "");
       setValue("defaultProxyUrl", cfg.defaultProxyUrl || "");
+      setValue("proxyPoolEnabled", String(Boolean(cfg.proxyPoolEnabled)));
+      setValue("proxyMode", cfg.proxyMode || "round_robin");
       setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
       setValue("ipBlocklist", joinRules(cfg.ipBlocklist || []));
     }
@@ -1066,6 +1147,8 @@
           body: JSON.stringify({
             upstreamBaseUrl: value("upstreamBaseUrl"),
             defaultProxyUrl: value("defaultProxyUrl"),
+            proxyPoolEnabled: value("proxyPoolEnabled") === "true",
+            proxyMode: value("proxyMode") || "round_robin",
             ipAllowlist: splitRules(value("ipAllowlist")),
             ipBlocklist: splitRules(value("ipBlocklist"))
           })
@@ -1076,6 +1159,121 @@
         toast(e.message, "error");
       } finally {
         button.disabled = false;
+      }
+    }
+
+    async function loadProxies(showToast = false) {
+      try {
+        const data = await api("/api/admin/proxies");
+        proxies = data.items || [];
+        proxyStats = data.stats || proxyStats;
+        renderProxies();
+        if (showToast) toast("代理已加载");
+      } catch (e) {
+        if (e.status === 401) {
+          showLogin();
+          return;
+        }
+        toast(e.message, "error");
+      }
+    }
+
+    function renderProxies() {
+      el("proxyMetricTotal").textContent = proxyStats.total || 0;
+      el("proxyMetricOnline").textContent = proxyStats.online || 0;
+      el("proxyMetricDisabled").textContent = proxyStats.disabled || 0;
+      el("proxyMetricConnections").textContent = proxyStats.connections || 0;
+      el("proxyEmptyState").classList.toggle("hidden", proxies.length > 0);
+      el("proxiesTable").innerHTML = proxies.map(p => `
+        <tr>
+          <td><strong>${escapeHtml(p.name || p.id)}</strong><div class="muted mono">${escapeHtml(p.id)}</div></td>
+          <td class="truncate">${escapeHtml(p.proxyUrl || "自动推导中")}</td>
+          <td>${proxyStatusPill(p)}</td>
+          <td>${p.currentConnections || 0}/${p.maxConcurrency || 100}</td>
+          <td>${p.totalRequests || 0}<div class="muted">失败 ${p.failedRequests || 0}</div></td>
+          <td>${formatBytes(p.bytesIn || 0)} / ${formatBytes(p.bytesOut || 0)}</td>
+          <td>${formatDateTime(p.lastReportAt)}</td>
+          <td class="truncate">${escapeHtml(p.lastError || "-")}</td>
+          <td>
+            <div class="row-actions">
+              <button class="secondary" type="button" onclick="toggleProxy('${p.id}')">${p.enabled ? "停用" : "启用"}</button>
+              <button class="secondary" type="button" onclick="openProxyDialog('${p.id}')">编辑</button>
+              <button class="danger" type="button" onclick="deleteProxy('${p.id}')">删除</button>
+            </div>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    function proxyStatusPill(p) {
+      if (!p.enabled) return `<span class="pill warn">停用</span>`;
+      if (p.online) return `<span class="pill">在线</span>`;
+      return `<span class="pill bad">离线</span>`;
+    }
+
+    function openProxyDialog(id) {
+      editingProxyId = id;
+      const proxy = proxies.find(p => p.id === id);
+      if (!proxy) return;
+      el("proxyDialogTitle").textContent = `编辑代理 ${proxy.name || proxy.id}`;
+      setValue("proxyName", proxy.name || "");
+      setValue("proxyNodeUrl", proxy.proxyUrl || "");
+      setValue("proxyMaxConcurrency", String(proxy.maxConcurrency || 100));
+      setValue("proxyEnabled", String(Boolean(proxy.enabled)));
+      proxyDialog.showModal();
+    }
+
+    async function saveProxy() {
+      if (!editingProxyId) return;
+      el("saveProxyButton").disabled = true;
+      try {
+        await api(`/api/admin/proxies/${editingProxyId}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            name: value("proxyName"),
+            proxyUrl: value("proxyNodeUrl"),
+            enabled: value("proxyEnabled") === "true",
+            maxConcurrency: Number(value("proxyMaxConcurrency") || "100")
+          })
+        });
+        proxyDialog.close();
+        await loadProxies(false);
+        toast("代理已保存");
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        el("saveProxyButton").disabled = false;
+      }
+    }
+
+    async function toggleProxy(id) {
+      const proxy = proxies.find(p => p.id === id);
+      if (!proxy) return;
+      try {
+        await api(`/api/admin/proxies/${id}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            name: proxy.name,
+            proxyUrl: proxy.proxyUrl,
+            enabled: !proxy.enabled,
+            maxConcurrency: proxy.maxConcurrency || 100
+          })
+        });
+        await loadProxies(false);
+        toast(proxy.enabled ? "代理已停用" : "代理已启用");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+
+    async function deleteProxy(id) {
+      if (!confirm("确认删除这个代理节点？节点下次上报会重新注册。")) return;
+      try {
+        await api(`/api/admin/proxies/${id}`, { method: "DELETE" });
+        await loadProxies(false);
+        toast("代理已删除");
+      } catch (e) {
+        toast(e.message, "error");
       }
     }
 
@@ -1819,6 +2017,17 @@
     function formatDateTime(value) {
       if (!value || String(value).startsWith("0001-")) return "<span class=\"muted\">-</span>";
       return new Date(value).toLocaleString();
+    }
+
+    function formatBytes(value) {
+      let n = Number(value || 0);
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let idx = 0;
+      while (n >= 1024 && idx < units.length - 1) {
+        n /= 1024;
+        idx++;
+      }
+      return `${idx === 0 ? Math.round(n) : n.toFixed(1)} ${units[idx]}`;
     }
 
     function maskKey(key) {

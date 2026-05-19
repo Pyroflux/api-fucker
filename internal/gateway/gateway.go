@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -30,23 +31,28 @@ const (
 
 var (
 	errNoAvailableKey        = errors.New("no available upstream key")
+	errNoAvailableProxy      = errors.New("no available proxy node")
 	errUpstreamNotConfigured = errors.New("upstream base URL is not configured")
 )
 
 type Gateway struct {
 	store *store.Store
 
-	mu         sync.Mutex
-	roundRobin int
-	inflight   map[string]int
-	clients    map[string]*http.Client
-	newClient  func(proxyURL string) (*http.Client, error)
+	mu              sync.Mutex
+	roundRobin      int
+	proxyRoundRobin int
+	inflight        map[string]int
+	proxyInflight   map[string]int
+	clients         map[string]*http.Client
+	newClient       func(proxyURL string) (*http.Client, error)
+	proxyNodeToken  string
 }
 
 type selectedKey struct {
-	key      store.Key
-	baseURL  string
-	proxyURL string
+	key         store.Key
+	baseURL     string
+	proxyURL    string
+	proxyNodeID string
 }
 
 func (s selectedKey) usesProxy() bool {
@@ -76,8 +82,19 @@ type TestProgressEvent struct {
 	Result     *UpstreamTestResult `json:"result,omitempty"`
 }
 
-func New(st *store.Store, _ *http.Client) *Gateway {
-	return &Gateway{store: st, inflight: make(map[string]int), clients: make(map[string]*http.Client), newClient: httpClientForProxy}
+func New(st *store.Store, _ *http.Client, proxyNodeToken ...string) *Gateway {
+	token := ""
+	if len(proxyNodeToken) > 0 {
+		token = proxyNodeToken[0]
+	}
+	return &Gateway{
+		store:          st,
+		inflight:       make(map[string]int),
+		proxyInflight:  make(map[string]int),
+		clients:        make(map[string]*http.Client),
+		newClient:      httpClientForProxy,
+		proxyNodeToken: token,
+	}
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,13 +119,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	selected, err := g.acquireKey()
 	if err != nil {
 		status := http.StatusTooManyRequests
-		if errors.Is(err, errUpstreamNotConfigured) {
+		if errors.Is(err, errUpstreamNotConfigured) || errors.Is(err, errNoAvailableProxy) {
 			status = http.StatusServiceUnavailable
 		}
 		http.Error(w, err.Error(), status)
 		return
 	}
-	defer g.releaseKey(selected.key.ID)
+	defer g.releaseSelected(selected)
 
 	capture := store.Capture{
 		KeyID:         selected.key.ID,
@@ -190,6 +207,7 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		return selectedKey{}, err
 	}
 	cfg, _ := g.store.GlobalConfig()
+	proxyNodes, _ := g.store.ListProxyNodes(time.Now().UTC())
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -226,15 +244,56 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 	if strings.TrimSpace(key.ProxyURL) != "" {
 		proxyURL = strings.TrimSpace(key.ProxyURL)
 	}
-	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL}, nil
+	proxyNodeID := ""
+	if cfg.ProxyPoolEnabled {
+		node, err := g.selectProxyNodeLocked(key.ID, cfg.ProxyMode, proxyNodes)
+		if err != nil {
+			g.inflight[key.ID]--
+			return selectedKey{}, err
+		}
+		proxyURL = proxyURLWithToken(node.ProxyURL, g.proxyNodeToken)
+		proxyNodeID = node.ID
+		g.proxyInflight[node.ID]++
+	}
+	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL, proxyNodeID: proxyNodeID}, nil
 }
 
-func (g *Gateway) releaseKey(id string) {
+func (g *Gateway) releaseSelected(selected selectedKey) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.inflight[id] > 0 {
-		g.inflight[id]--
+	if g.inflight[selected.key.ID] > 0 {
+		g.inflight[selected.key.ID]--
 	}
+	if selected.proxyNodeID != "" && g.proxyInflight[selected.proxyNodeID] > 0 {
+		g.proxyInflight[selected.proxyNodeID]--
+	}
+}
+
+func (g *Gateway) selectProxyNodeLocked(keyID string, mode string, nodes []store.ProxyNodeView) (store.ProxyNodeView, error) {
+	candidates := make([]store.ProxyNodeView, 0, len(nodes))
+	for _, node := range nodes {
+		if !node.Enabled || !node.Online || strings.TrimSpace(node.ProxyURL) == "" {
+			continue
+		}
+		maxConcurrency := node.MaxConcurrency
+		if maxConcurrency <= 0 {
+			maxConcurrency = 100
+		}
+		if g.proxyInflight[node.ID]+node.CurrentConnections >= maxConcurrency {
+			continue
+		}
+		candidates = append(candidates, node)
+	}
+	if len(candidates) == 0 {
+		return store.ProxyNodeView{}, errNoAvailableProxy
+	}
+	if strings.TrimSpace(mode) == store.ProxyModeKeyBinding {
+		idx := int(stableHash(keyID) % uint32(len(candidates)))
+		return candidates[idx], nil
+	}
+	idx := g.proxyRoundRobin % len(candidates)
+	g.proxyRoundRobin++
+	return candidates[idx], nil
 }
 
 func (g *Gateway) forward(ctx context.Context, selected selectedKey, method string, upstreamPath string, body []byte, isStream bool, w http.ResponseWriter, progress func(TestProgressEvent)) (int, http.Header, []byte, error) {
@@ -677,6 +736,26 @@ func (g *Gateway) clientForProxy(proxyURL string) (*http.Client, error) {
 	g.clients[key] = client
 	g.mu.Unlock()
 	return client, nil
+}
+
+func proxyURLWithToken(proxyValue string, token string) string {
+	proxyValue = strings.TrimSpace(proxyValue)
+	token = strings.TrimSpace(token)
+	if proxyValue == "" || token == "" {
+		return proxyValue
+	}
+	u, err := url.Parse(proxyValue)
+	if err != nil || u.Host == "" {
+		return proxyValue
+	}
+	u.User = url.UserPassword("node", token)
+	return u.String()
+}
+
+func stableHash(value string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return h.Sum32()
 }
 
 func newUpstreamRequest(ctx context.Context, selected selectedKey, method string, upstreamPath string, body []byte, isStream bool) (*http.Request, error) {

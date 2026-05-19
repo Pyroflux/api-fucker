@@ -10,7 +10,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/api-fucker ./cmd/server
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/api-fucker ./cmd/server && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/proxy-client ./cmd/proxy-client
 
 FROM alpine:3.21
 
@@ -23,12 +24,14 @@ RUN apk add --no-cache ca-certificates && \
 WORKDIR /app
 
 COPY --from=builder /out/api-fucker /app/api-fucker
+COPY --from=builder /out/proxy-client /app/proxy-client
 
 ENV PORT=8080 \
     ADMIN_PORT=8081 \
-    DATA_PATH=/data/data.db
+    DATA_PATH=/data/data.db \
+    LISTEN_ADDR=:9070
 
-EXPOSE 8080 8081
+EXPOSE 8080 8081 9070
 VOLUME ["/data"]
 
 USER app

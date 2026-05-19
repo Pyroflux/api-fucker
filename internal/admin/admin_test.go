@@ -253,6 +253,53 @@ func TestMetricsEndpointIncludesLiveConcurrency(t *testing.T) {
 	}
 }
 
+func TestProxyReportAndManagementEndpoints(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+	h.SetProxyNodeToken("node-token")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/proxies/report", strings.NewReader(`{"id":"node-a","name":"vps-a","listenAddr":":9070","maxConcurrency":50}`))
+	req.Header.Set("Authorization", "Bearer node-token")
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.9:4567"
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("report status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	list := adminGet(h, "/api/admin/proxies")
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %s", list.Code, list.Body.String())
+	}
+	if !strings.Contains(list.Body.String(), "http://203.0.113.9:9070") {
+		t.Fatalf("missing derived proxy url: %s", list.Body.String())
+	}
+
+	update := httptest.NewRequest(http.MethodPut, "/api/admin/proxies/node-a", strings.NewReader(`{"name":"manual","proxyUrl":"http://203.0.113.10:9070","enabled":false,"maxConcurrency":20}`))
+	update.Header.Set("Authorization", "Bearer token")
+	update.Header.Set("Content-Type", "application/json")
+	updateRes := httptest.NewRecorder()
+	h.ServeHTTP(updateRes, update)
+	if updateRes.Code != http.StatusOK {
+		t.Fatalf("update status = %d body = %s", updateRes.Code, updateRes.Body.String())
+	}
+	node, err := h.store.GetProxyNode("node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Enabled || node.MaxConcurrency != 20 || node.Name != "manual" {
+		t.Fatalf("unexpected updated proxy: %+v", node)
+	}
+
+	unauth := httptest.NewRequest(http.MethodPost, "/api/admin/proxies/report", strings.NewReader(`{"id":"node-b"}`))
+	unauthRes := httptest.NewRecorder()
+	h.ServeHTTP(unauthRes, unauth)
+	if unauthRes.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthRes.Code)
+	}
+}
+
 func TestKeyModelsAndTestActions(t *testing.T) {
 	h, closeStore := newTestHandler(t, "token")
 	defer closeStore()

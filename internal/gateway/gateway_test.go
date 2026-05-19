@@ -506,6 +506,80 @@ func TestGatewayReturns503WhenUpstreamNotConfigured(t *testing.T) {
 	}
 }
 
+func TestGatewayProxyPoolRoundRobinUsesOnlineNodes(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:  "https://upstream.example",
+		DefaultProxyURL:  "http://global.example:8080",
+		ProxyPoolEnabled: true,
+		ProxyMode:        store.ProxyModeRoundRobin,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", MaxConcurrency: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range []store.ProxyNodeReport{
+		{ID: "node-a", Name: "a", ProxyURL: "http://10.0.0.1:9070", MaxConcurrency: 10},
+		{ID: "node-b", Name: "b", ProxyURL: "http://10.0.0.2:9070", MaxConcurrency: 10},
+	} {
+		if _, err := st.UpsertProxyNodeReport(node, "127.0.0.1:1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var proxies []string
+	gw := New(st, nil, "node-token")
+	gw.newClient = func(proxyURL string) (*http.Client, error) {
+		proxies = append(proxies, proxyURL)
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return jsonResponse(r, http.StatusOK, map[string]bool{"ok": true}), nil
+		})}, nil
+	}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d body = %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if len(proxies) != 2 {
+		t.Fatalf("proxies = %+v", proxies)
+	}
+	if !strings.Contains(proxies[0], "10.0.0.1:9070") || !strings.Contains(proxies[1], "10.0.0.2:9070") {
+		t.Fatalf("expected round robin proxies, got %+v", proxies)
+	}
+	if !strings.Contains(proxies[0], "node-token") {
+		t.Fatalf("expected proxy auth token injection, got %q", proxies[0])
+	}
+}
+
+func TestGatewayProxyPoolReturns503WithoutAvailableNode(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveGlobalConfig(store.GlobalConfig{UpstreamBaseURL: "https://upstream.example", ProxyPoolEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", MaxConcurrency: 1}); err != nil {
+		t.Fatal(err)
+	}
+	gw := New(st, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestGatewayReturns429WhenNoKeyAvailable(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/data.db")
 	if err != nil {

@@ -28,8 +28,10 @@ func main() {
 	}
 	defer st.Close()
 
-	gw := gateway.New(st, &http.Client{Timeout: 0})
+	proxyNodeToken := os.Getenv("PROXY_NODE_TOKEN")
+	gw := gateway.New(st, &http.Client{Timeout: 0}, proxyNodeToken)
 	adminHandler := admin.New(st, os.Getenv("ADMIN_TOKEN"), gw.CurrentConcurrency, gw)
+	adminHandler.SetProxyNodeToken(proxyNodeToken)
 
 	apiMux := http.NewServeMux()
 	apiMux.Handle("/v1/chat/completions", gw)

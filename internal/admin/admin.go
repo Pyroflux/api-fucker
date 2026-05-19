@@ -23,6 +23,7 @@ var staticFS embed.FS
 type Handler struct {
 	store              *store.Store
 	adminToken         string
+	proxyNodeToken     string
 	currentConcurrency func() map[string]int
 	upstream           upstreamTester
 }
@@ -64,6 +65,13 @@ type bulkDeleteRequest struct {
 	All bool     `json:"all"`
 }
 
+type proxyUpdateRequest struct {
+	Name           string `json:"name"`
+	ProxyURL       string `json:"proxyUrl"`
+	Enabled        bool   `json:"enabled"`
+	MaxConcurrency int    `json:"maxConcurrency"`
+}
+
 type keyListResponse struct {
 	Items      []store.KeyView `json:"items"`
 	Total      int             `json:"total"`
@@ -91,6 +99,10 @@ func New(st *store.Store, token string, currentConcurrency func() map[string]int
 	return &Handler{store: st, adminToken: normalizeAdminToken(token), currentConcurrency: currentConcurrency, upstream: tester}
 }
 
+func (h *Handler) SetProxyNodeToken(token string) {
+	h.proxyNodeToken = normalizeAdminToken(token)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin" {
 		h.serveAdmin(w, r)
@@ -103,6 +115,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/admin/logout" && r.Method == http.MethodPost {
 		h.logout(w, r)
+		return
+	}
+	if r.URL.Path == "/api/admin/proxies/report" && r.Method == http.MethodPost {
+		h.proxyReport(w, r)
 		return
 	}
 
@@ -126,6 +142,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.restoreAllKeys(w, r)
 	case r.URL.Path == "/api/admin/metrics":
 		h.metrics(w, r)
+	case r.URL.Path == "/api/admin/proxies":
+		h.proxies(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/admin/proxies/"):
+		h.proxyByID(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/admin/keys/"):
 		h.keyByID(w, r)
 	default:
@@ -206,6 +226,70 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 		points = appendLiveConcurrencyPoint(points, granularity, now, totalInflight(h.currentConcurrency()))
 	}
 	respond(w, map[string]any{"items": points}, err)
+}
+
+func (h *Handler) proxies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	nodes, err := h.store.ListProxyNodes(time.Now().UTC())
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	stats := map[string]int{"total": len(nodes)}
+	for _, node := range nodes {
+		if node.Online {
+			stats["online"]++
+		}
+		if !node.Enabled {
+			stats["disabled"]++
+		}
+		stats["connections"] += node.CurrentConnections
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": nodes, "stats": stats})
+}
+
+func (h *Handler) proxyByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/admin/proxies/"), "/")
+	if id == "" || id == "report" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var req proxyUpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		updated, err := h.store.UpdateProxyNode(id, store.ProxyNode{
+			Name:           req.Name,
+			ProxyURL:       req.ProxyURL,
+			Enabled:        req.Enabled,
+			MaxConcurrency: req.MaxConcurrency,
+		})
+		respond(w, updated, err)
+	case http.MethodDelete:
+		respond(w, map[string]bool{"ok": true}, h.store.DeleteProxyNode(id))
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func (h *Handler) proxyReport(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizedProxyNode(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var report store.ProxyNodeReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	node, err := h.store.UpsertProxyNodeReport(report, r.RemoteAddr)
+	respond(w, node, err)
 }
 
 func appendLiveConcurrencyPoint(points []store.MetricPoint, granularity string, now time.Time, inflight int) []store.MetricPoint {
@@ -367,6 +451,17 @@ func (h *Handler) authorized(r *http.Request) bool {
 		return sameAdminToken(strings.TrimPrefix(auth, "Bearer "), h.adminToken)
 	}
 	return false
+}
+
+func (h *Handler) authorizedProxyNode(r *http.Request) bool {
+	if h.proxyNodeToken == "" {
+		return false
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	return sameAdminToken(strings.TrimPrefix(auth, "Bearer "), h.proxyNodeToken)
 }
 
 func normalizeAdminToken(token string) string {

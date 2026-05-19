@@ -268,3 +268,57 @@ func TestMetricsAggregateAndTrackFirstByte(t *testing.T) {
 		t.Fatalf("last first byte = %v, want %d", updated.LastFirstByteMS, second)
 	}
 }
+
+func TestProxyNodeReportRegistersAndPreservesDisabledState(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	node, err := st.UpsertProxyNodeReport(ProxyNodeReport{
+		ID:                 "node-a",
+		Name:               "vps-a",
+		ListenAddr:         ":9070",
+		CurrentConnections: 2,
+		TotalRequests:      10,
+		MaxConcurrency:     50,
+	}, "203.0.113.9:4567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !node.Enabled || node.ProxyURL != "http://203.0.113.9:9070" || node.MaxConcurrency != 50 {
+		t.Fatalf("unexpected node: %+v", node)
+	}
+
+	updated, err := st.UpdateProxyNode(node.ID, ProxyNode{Name: "manual", ProxyURL: node.ProxyURL, Enabled: false, MaxConcurrency: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Enabled {
+		t.Fatalf("expected disabled node: %+v", updated)
+	}
+
+	node, err = st.UpsertProxyNodeReport(ProxyNodeReport{ID: "node-a", Name: "vps-a", ListenAddr: ":9070"}, "203.0.113.9:4567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Enabled || node.MaxConcurrency != 25 {
+		t.Fatalf("report should not re-enable or overwrite admin concurrency: %+v", node)
+	}
+
+	nodes, err := st.ListProxyNodes(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Status != "disabled" {
+		t.Fatalf("unexpected proxy node view: %+v", nodes)
+	}
+	nodes, err = st.ListProxyNodes(time.Now().UTC().Add(31 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].Online {
+		t.Fatalf("expected node to be offline after timeout: %+v", nodes[0])
+	}
+}
