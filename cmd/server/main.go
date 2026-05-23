@@ -33,6 +33,7 @@ func main() {
 	adminHandler := admin.New(st, os.Getenv("ADMIN_TOKEN"), gw.CurrentConcurrency, gw)
 	adminHandler.SetProxyNodeToken(proxyNodeToken)
 	adminHandler.SetQueueDepth(gw.QueueDepth)
+	adminHandler.SetKeyMinuteUsage(gw.KeyMinuteUsage)
 
 	apiMux := http.NewServeMux()
 	apiMux.Handle("/v1/chat/completions", gw)

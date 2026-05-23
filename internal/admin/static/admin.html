@@ -711,6 +711,7 @@
                 <th>代理覆盖</th>
                 <th>状态</th>
                 <th>并发</th>
+                <th>本分钟</th>
                 <th>首字响应</th>
                 <th>总响应</th>
                 <th>错误</th>
@@ -838,6 +839,9 @@
           </label>
           <label>单 Key 每分钟上限
             <input id="keyMaxRequestsPerMinute" type="number" min="0" step="1" placeholder="0 表示不限制">
+          </label>
+          <label>慢启动间隔 ms
+            <input id="launchIntervalMs" type="number" min="0" step="50" placeholder="0 表示不延迟">
           </label>
           <label class="span-2">请求 IP 白名单
             <textarea id="ipAllowlist" placeholder="为空表示不限制&#10;127.0.0.1&#10;192.*"></textarea>
@@ -1014,6 +1018,7 @@
     let metricItems = [];
     let chartHitPoints = [];
     let chartGeometry = null;
+    let globalConfig = {};
     let proxies = [];
     let proxyStats = { total: 0, online: 0, disabled: 0, connections: 0 };
     let editingProxyId = "";
@@ -1089,6 +1094,7 @@
     async function loadAll(showToast = true) {
       try {
         const cfg = await api("/api/admin/config");
+        globalConfig = cfg || {};
         if (!el("configDialog").open) {
           fillConfigForm(cfg);
         }
@@ -1178,6 +1184,7 @@
       setValue("maxQueueSize", String(cfg.maxQueueSize || 0));
       setValue("queueTimeoutMs", String(cfg.queueTimeoutMs || 0));
       setValue("keyMaxRequestsPerMinute", String(cfg.keyMaxRequestsPerMinute || 0));
+      setValue("launchIntervalMs", String(cfg.launchIntervalMs || 0));
       setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
       setValue("ipBlocklist", joinRules(cfg.ipBlocklist || []));
     }
@@ -1197,6 +1204,7 @@
             maxQueueSize: Number(value("maxQueueSize") || "0"),
             queueTimeoutMs: Number(value("queueTimeoutMs") || "0"),
             keyMaxRequestsPerMinute: Number(value("keyMaxRequestsPerMinute") || "0"),
+            launchIntervalMs: Number(value("launchIntervalMs") || "0"),
             ipAllowlist: splitRules(value("ipAllowlist")),
             ipBlocklist: splitRules(value("ipBlocklist"))
           })
@@ -1780,6 +1788,7 @@
           <td class="truncate">${escapeHtml(k.proxyUrl || "使用全局")}</td>
           <td>${statusPill(k)}</td>
           <td>${k.currentConcurrency || 0}/${k.maxConcurrency}</td>
+          <td>${k.currentMinuteRequests || 0}/${Number(globalConfig.keyMaxRequestsPerMinute) > 0 ? globalConfig.keyMaxRequestsPerMinute : "-"}</td>
           <td>${formatDuration(k.lastFirstByteMs)}</td>
           <td>${formatDuration(k.lastResponseMs)}</td>
           <td><span>${k.consecutiveErrors || 0}</span>${k.lastError ? `<div class="muted truncate">${escapeHtml(k.lastError)}</div>` : ""}</td>

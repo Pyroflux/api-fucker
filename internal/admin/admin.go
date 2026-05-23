@@ -26,6 +26,7 @@ type Handler struct {
 	proxyNodeToken     string
 	currentConcurrency func() map[string]int
 	queueDepth         func() int
+	keyMinuteUsage     func() map[string]int
 	upstream           upstreamTester
 }
 
@@ -102,6 +103,7 @@ func New(st *store.Store, token string, currentConcurrency func() map[string]int
 		adminToken:         normalizeAdminToken(token),
 		currentConcurrency: currentConcurrency,
 		queueDepth:         func() int { return 0 },
+		keyMinuteUsage:     func() map[string]int { return nil },
 		upstream:           tester,
 	}
 }
@@ -115,6 +117,13 @@ func (h *Handler) SetQueueDepth(fn func() int) {
 		fn = func() int { return 0 }
 	}
 	h.queueDepth = fn
+}
+
+func (h *Handler) SetKeyMinuteUsage(fn func() map[string]int) {
+	if fn == nil {
+		fn = func() map[string]int { return nil }
+	}
+	h.keyMinuteUsage = fn
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -542,6 +551,7 @@ func (h *Handler) keys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		inflight := h.currentConcurrency()
+		minuteUsage := h.keyMinuteUsage()
 		views := make([]store.KeyView, 0, len(keys))
 		stats := keyListStats{Total: len(keys)}
 		for _, key := range keys {
@@ -553,7 +563,7 @@ func (h *Handler) keys(w http.ResponseWriter, r *http.Request) {
 				stats.Paused++
 			}
 			stats.Inflight += current
-			view := store.KeyView{Key: key, CurrentConcurrency: current}
+			view := store.KeyView{Key: key, CurrentConcurrency: current, CurrentMinuteRequests: minuteUsage[key.ID]}
 			if matchesKeyStatusFilter(view, r.URL.Query().Get("status")) {
 				views = append(views, view)
 			}

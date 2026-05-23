@@ -48,6 +48,7 @@ type GlobalConfig struct {
 	MaxQueueSize            int       `json:"maxQueueSize"`
 	QueueTimeoutMS          int       `json:"queueTimeoutMs"`
 	KeyMaxRequestsPerMinute int       `json:"keyMaxRequestsPerMinute"`
+	LaunchIntervalMS        int       `json:"launchIntervalMs"`
 	UpdatedAt               time.Time `json:"updatedAt"`
 }
 
@@ -72,7 +73,8 @@ type Key struct {
 
 type KeyView struct {
 	Key
-	CurrentConcurrency int `json:"currentConcurrency"`
+	CurrentConcurrency    int `json:"currentConcurrency"`
+	CurrentMinuteRequests int `json:"currentMinuteRequests"`
 }
 
 type ImportKeyInput struct {
@@ -269,6 +271,9 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 	}
 	if cfg.KeyMaxRequestsPerMinute < 0 {
 		return fmt.Errorf("key max requests per minute cannot be negative")
+	}
+	if cfg.LaunchIntervalMS < 0 {
+		return fmt.Errorf("launch interval cannot be negative")
 	}
 	cfg.ProxyMode = normalizeProxyMode(cfg.ProxyMode)
 	cfg.IPAllowlist = normalizeRules(cfg.IPAllowlist)

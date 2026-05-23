@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -710,6 +712,146 @@ func TestGatewayPerKeyRateLimitReturns429(t *testing.T) {
 	gw.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("3rd request expected 429 got %d", rec.Code)
+	}
+}
+
+func TestGatewayLaunchIntervalSerializesBursts(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:  "https://upstream.example",
+		LaunchIntervalMS: 80,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var launchTimes []time.Time
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			mu.Lock()
+			launchTimes = append(launchTimes, time.Now())
+			mu.Unlock()
+			return jsonResponse(r, http.StatusOK, map[string]string{"ok": "true"}), nil
+		})}, nil
+	}
+
+	const burst = 5
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, body=%s", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(launchTimes) != burst {
+		t.Fatalf("launches = %d, want %d", len(launchTimes), burst)
+	}
+	sort.Slice(launchTimes, func(i, j int) bool { return launchTimes[i].Before(launchTimes[j]) })
+	// First request is immediate; subsequent ones must be spaced by >= ~80ms.
+	// Allow a small scheduling tolerance (15ms) below the configured interval.
+	const minSpacing = 65 * time.Millisecond
+	for i := 1; i < len(launchTimes); i++ {
+		spacing := launchTimes[i].Sub(launchTimes[i-1])
+		if spacing < minSpacing {
+			t.Fatalf("launch %d spacing = %s, want >= %s (interval=80ms)", i, spacing, minSpacing)
+		}
+	}
+}
+
+func TestGatewayKeyMinuteUsageSlidingWindowExpiresOldHits(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw := New(st, nil)
+	now := time.Now()
+	gw.mu.Lock()
+	gw.keyMinute[key.ID] = &minuteCounter{
+		hits: []time.Time{
+			now.Add(-90 * time.Second), // expired
+			now.Add(-70 * time.Second), // expired
+			now.Add(-30 * time.Second), // still in window
+			now.Add(-5 * time.Second),  // still in window
+		},
+	}
+	gw.mu.Unlock()
+
+	usage := gw.KeyMinuteUsage()
+	if usage[key.ID] != 2 {
+		t.Fatalf("usage = %v, want {%s: 2} (only last-60s hits count)", usage, key.ID)
+	}
+	// Underlying slice should have been pruned in place.
+	gw.mu.Lock()
+	remaining := len(gw.keyMinute[key.ID].hits)
+	gw.mu.Unlock()
+	if remaining != 2 {
+		t.Fatalf("hits after prune = %d, want 2", remaining)
+	}
+}
+
+func TestGatewayKeyMinuteUsageReflectsCounts(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:         "https://upstream.example",
+		KeyMaxRequestsPerMinute: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return jsonResponse(r, http.StatusOK, map[string]string{"ok": "true"}), nil
+		})}, nil
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d expected 200 got %d", i, rec.Code)
+		}
+	}
+
+	usage := gw.KeyMinuteUsage()
+	if usage[key.ID] != 2 {
+		t.Fatalf("usage = %v, want {%s: 2}", usage, key.ID)
 	}
 }
 

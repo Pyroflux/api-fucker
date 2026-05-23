@@ -286,6 +286,22 @@ func TestSaveGlobalConfigRejectsNegativeKeyRpm(t *testing.T) {
 	}
 }
 
+func TestSaveGlobalConfigRejectsNegativeLaunchInterval(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	err = st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:  "https://upstream.example",
+		LaunchIntervalMS: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "launch interval") {
+		t.Fatalf("expected negative launch-interval error, got %v", err)
+	}
+}
+
 func TestRecordMetricAggregatesQueueDepth(t *testing.T) {
 	st, err := Open(t.TempDir() + "/data.db")
 	if err != nil {

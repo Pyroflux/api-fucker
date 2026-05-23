@@ -56,11 +56,40 @@ type Gateway struct {
 	globalQueued  int
 	queueNotify   chan struct{}
 	queuePeak     int32
+
+	launchMu   sync.Mutex
+	nextLaunch time.Time
 }
 
+// minuteCounter is a per-key sliding-window log: it stores the timestamps
+// of every request admitted in the trailing minute. A request is "in window"
+// iff its timestamp is within the last 60s of `now`. Prune drops the expired
+// prefix in-place so reads are accurate.
 type minuteCounter struct {
-	windowStart time.Time
-	count       int
+	hits []time.Time
+}
+
+const minuteWindow = time.Minute
+
+// prune removes timestamps older than `now - minuteWindow` from the front
+// of hits. Since hits is appended in monotonically increasing time order,
+// the expired entries are always a prefix.
+func (mc *minuteCounter) prune(now time.Time) {
+	cutoff := now.Add(-minuteWindow)
+	i := 0
+	for i < len(mc.hits) && !mc.hits[i].After(cutoff) {
+		i++
+	}
+	if i == 0 {
+		return
+	}
+	// Shift remaining entries to the front so the underlying array can be
+	// reused without growing without bound.
+	mc.hits = mc.hits[:copy(mc.hits, mc.hits[i:])]
+}
+
+func (mc *minuteCounter) count() int {
+	return len(mc.hits)
 }
 
 type selectedKey struct {
@@ -145,6 +174,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer releaseGlobal()
+		if err := g.waitForLaunchSlot(r.Context(), cfg.LaunchIntervalMS); err != nil {
+			http.Error(w, err.Error(), http.StatusGatewayTimeout)
+			return
+		}
 	}
 
 	selected, err := g.acquireKey()
@@ -298,6 +331,65 @@ func (g *Gateway) consumeQueuePeak() int {
 	return int(atomic.SwapInt32(&g.queuePeak, 0))
 }
 
+// waitForLaunchSlot enforces a minimum spacing between successive upstream
+// launches so a sudden burst (e.g. 40 simultaneous clients hitting a freshly
+// raised concurrency cap) cannot land on the relay all in the same instant.
+// Each caller atomically reserves the next slot on the timeline, then sleeps
+// until that wall-clock instant. Returns ctx.Err() if cancelled while waiting.
+// intervalMs <= 0 disables the pacer.
+func (g *Gateway) waitForLaunchSlot(ctx context.Context, intervalMs int) error {
+	if intervalMs <= 0 {
+		return nil
+	}
+	interval := time.Duration(intervalMs) * time.Millisecond
+
+	g.launchMu.Lock()
+	now := time.Now()
+	var wait time.Duration
+	if g.nextLaunch.Before(now) {
+		g.nextLaunch = now.Add(interval)
+	} else {
+		wait = g.nextLaunch.Sub(now)
+		g.nextLaunch = g.nextLaunch.Add(interval)
+	}
+	g.launchMu.Unlock()
+
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// KeyMinuteUsage returns a snapshot of each key's request count in the
+// trailing 60s sliding window. Each entry is pruned of expired hits before
+// reading, and empty entries are dropped from the map.
+func (g *Gateway) KeyMinuteUsage() map[string]int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]int, len(g.keyMinute))
+	for id, mc := range g.keyMinute {
+		if mc == nil {
+			delete(g.keyMinute, id)
+			continue
+		}
+		mc.prune(now)
+		if mc.count() == 0 {
+			delete(g.keyMinute, id)
+			continue
+		}
+		out[id] = mc.count()
+	}
+	return out
+}
+
 func routeRequest(r *http.Request) (string, string, error) {
 	switch r.URL.Path {
 	case chatPath:
@@ -319,11 +411,10 @@ func (g *Gateway) CurrentConcurrency() map[string]int {
 	return out
 }
 
-// pruneKeyMinuteLocked drops minuteCounter entries whose window has rolled
-// over and any entries belonging to keys that no longer exist. Caller must
-// hold g.mu. The post-condition is that every remaining entry corresponds to
-// a still-existing key whose current window has not yet elapsed, which lets
-// the candidate loop test only `count >= rpmLimit`.
+// pruneKeyMinuteLocked drops minuteCounter entries belonging to keys that
+// no longer exist and prunes expired hits from the remainder. After this
+// runs the candidate loop can treat `mc.count() >= rpmLimit` as a
+// sliding-window check (no further age inspection needed).
 func (g *Gateway) pruneKeyMinuteLocked(keys []store.Key, now time.Time) {
 	if len(g.keyMinute) == 0 {
 		return
@@ -333,7 +424,12 @@ func (g *Gateway) pruneKeyMinuteLocked(keys []store.Key, now time.Time) {
 		existing[k.ID] = struct{}{}
 	}
 	for id, mc := range g.keyMinute {
-		if _, ok := existing[id]; !ok || now.Sub(mc.windowStart) >= time.Minute {
+		if _, ok := existing[id]; !ok || mc == nil {
+			delete(g.keyMinute, id)
+			continue
+		}
+		mc.prune(now)
+		if mc.count() == 0 {
 			delete(g.keyMinute, id)
 		}
 	}
@@ -373,7 +469,7 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 			continue
 		}
 		if rpmLimit > 0 {
-			if mc := g.keyMinute[key.ID]; mc != nil && mc.count >= rpmLimit {
+			if mc := g.keyMinute[key.ID]; mc != nil && mc.count() >= rpmLimit {
 				continue
 			}
 		}
@@ -415,11 +511,11 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 
 	if rpmLimit > 0 {
 		mc := g.keyMinute[key.ID]
-		if mc == nil || now.Sub(mc.windowStart) >= time.Minute {
-			g.keyMinute[key.ID] = &minuteCounter{windowStart: now, count: 1}
-		} else {
-			mc.count++
+		if mc == nil {
+			mc = &minuteCounter{}
+			g.keyMinute[key.ID] = mc
 		}
+		mc.hits = append(mc.hits, now)
 	}
 	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL, proxyNodeID: proxyNodeID}, nil
 }
