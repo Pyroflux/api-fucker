@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -266,6 +267,56 @@ func TestMetricsAggregateAndTrackFirstByte(t *testing.T) {
 	}
 	if updated.LastFirstByteMS == nil || *updated.LastFirstByteMS != second {
 		t.Fatalf("last first byte = %v, want %d", updated.LastFirstByteMS, second)
+	}
+}
+
+func TestSaveGlobalConfigRejectsNegativeKeyRpm(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	err = st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:         "https://upstream.example",
+		KeyMaxRequestsPerMinute: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "key max requests per minute") {
+		t.Fatalf("expected negative-rpm error, got %v", err)
+	}
+}
+
+func TestRecordMetricAggregatesQueueDepth(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret-q", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 5, 18, 10, 30, 0, 0, time.UTC)
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now, QueueDepth: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now.Add(15 * time.Second), QueueDepth: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMetric(key.ID, MetricSample{Time: now.Add(40 * time.Second), QueueDepth: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := st.ListMetrics("minute", now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("points = %d, want 1", len(points))
+	}
+	if points[0].QueueDepth != 7 {
+		t.Fatalf("queueDepth = %d, want 7 (max across bucket)", points[0].QueueDepth)
 	}
 }
 

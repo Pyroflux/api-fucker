@@ -631,38 +631,85 @@ func TestGatewayRetriesTransientTransportError(t *testing.T) {
 	}
 }
 
-func TestGatewayRetriesGatewayTimeoutStatus(t *testing.T) {
+func TestGatewayDoesNotRetryUpstream5xxStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			st, err := store.Open(t.TempDir() + "/data.db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+
+			if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1}); err != nil {
+				t.Fatal(err)
+			}
+
+			calls := 0
+			gw := New(st, nil)
+			gw.newClient = func(string) (*http.Client, error) {
+				return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					return jsonResponse(r, status, nil), nil
+				})}, nil
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, req)
+
+			if rec.Code != status {
+				t.Fatalf("expected %d got %d body %s", status, rec.Code, rec.Body.String())
+			}
+			if calls != 1 {
+				t.Fatalf("calls = %d, want 1 (5xx must not retry)", calls)
+			}
+		})
+	}
+}
+
+func TestGatewayPerKeyRateLimitReturns429(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/data.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1}); err != nil {
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:         "https://upstream.example",
+		KeyMaxRequestsPerMinute: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 10}); err != nil {
 		t.Fatal(err)
 	}
 
-	calls := 0
 	gw := New(st, nil)
 	gw.newClient = func(string) (*http.Client, error) {
 		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				return jsonResponse(r, http.StatusGatewayTimeout, nil), nil
-			}
 			return jsonResponse(r, http.StatusOK, map[string]string{"ok": "true"}), nil
 		})}, nil
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d expected 200 got %d body %s", i, rec.Code, rec.Body.String())
+		}
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d body %s", rec.Code, rec.Body.String())
-	}
-	if calls != 2 {
-		t.Fatalf("calls = %d, want 2", calls)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("3rd request expected 429 got %d", rec.Code)
 	}
 }
 

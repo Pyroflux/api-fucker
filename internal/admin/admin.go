@@ -25,6 +25,7 @@ type Handler struct {
 	adminToken         string
 	proxyNodeToken     string
 	currentConcurrency func() map[string]int
+	queueDepth         func() int
 	upstream           upstreamTester
 }
 
@@ -96,11 +97,24 @@ func New(st *store.Store, token string, currentConcurrency func() map[string]int
 	if len(upstream) > 0 {
 		tester = upstream[0]
 	}
-	return &Handler{store: st, adminToken: normalizeAdminToken(token), currentConcurrency: currentConcurrency, upstream: tester}
+	return &Handler{
+		store:              st,
+		adminToken:         normalizeAdminToken(token),
+		currentConcurrency: currentConcurrency,
+		queueDepth:         func() int { return 0 },
+		upstream:           tester,
+	}
 }
 
 func (h *Handler) SetProxyNodeToken(token string) {
 	h.proxyNodeToken = normalizeAdminToken(token)
+}
+
+func (h *Handler) SetQueueDepth(fn func() int) {
+	if fn == nil {
+		fn = func() int { return 0 }
+	}
+	h.queueDepth = fn
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +238,7 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	points, err := h.store.ListMetrics(granularity, now)
 	if err == nil {
 		points = appendLiveConcurrencyPoint(points, granularity, now, totalInflight(h.currentConcurrency()))
+		points = appendLiveQueueDepthPoint(points, granularity, now, h.queueDepth())
 	}
 	respond(w, map[string]any{"items": points}, err)
 }
@@ -306,6 +321,22 @@ func appendLiveConcurrencyPoint(points []store.MetricPoint, granularity string, 
 		}
 	}
 	return append(points, store.MetricPoint{Time: pointTime, Concurrency: inflight})
+}
+
+func appendLiveQueueDepthPoint(points []store.MetricPoint, granularity string, now time.Time, queued int) []store.MetricPoint {
+	if queued <= 0 {
+		return points
+	}
+	pointTime := metricPointTime(now, granularity)
+	for i := range points {
+		if points[i].Time.Equal(pointTime) {
+			if queued > points[i].QueueDepth {
+				points[i].QueueDepth = queued
+			}
+			return points
+		}
+	}
+	return append(points, store.MetricPoint{Time: pointTime, QueueDepth: queued})
 }
 
 func totalInflight(values map[string]int) int {

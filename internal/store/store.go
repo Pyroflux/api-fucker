@@ -38,13 +38,17 @@ type Store struct {
 }
 
 type GlobalConfig struct {
-	UpstreamBaseURL  string    `json:"upstreamBaseUrl"`
-	DefaultProxyURL  string    `json:"defaultProxyUrl"`
-	IPAllowlist      []string  `json:"ipAllowlist,omitempty"`
-	IPBlocklist      []string  `json:"ipBlocklist,omitempty"`
-	ProxyPoolEnabled bool      `json:"proxyPoolEnabled"`
-	ProxyMode        string    `json:"proxyMode"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	UpstreamBaseURL      string    `json:"upstreamBaseUrl"`
+	DefaultProxyURL      string    `json:"defaultProxyUrl"`
+	IPAllowlist          []string  `json:"ipAllowlist,omitempty"`
+	IPBlocklist          []string  `json:"ipBlocklist,omitempty"`
+	ProxyPoolEnabled     bool      `json:"proxyPoolEnabled"`
+	ProxyMode            string    `json:"proxyMode"`
+	GlobalMaxConcurrency    int       `json:"globalMaxConcurrency"`
+	MaxQueueSize            int       `json:"maxQueueSize"`
+	QueueTimeoutMS          int       `json:"queueTimeoutMs"`
+	KeyMaxRequestsPerMinute int       `json:"keyMaxRequestsPerMinute"`
+	UpdatedAt               time.Time `json:"updatedAt"`
 }
 
 type Key struct {
@@ -60,6 +64,7 @@ type Key struct {
 	ConsecutiveErrors int       `json:"consecutiveErrors"`
 	LastError         string    `json:"lastError"`
 	LastFirstByteMS   *int64    `json:"lastFirstByteMs,omitempty"`
+	LastResponseMS    *int64    `json:"lastResponseMs,omitempty"`
 	LastUsedAt        time.Time `json:"lastUsedAt"`
 	CreatedAt         time.Time `json:"createdAt"`
 	UpdatedAt         time.Time `json:"updatedAt"`
@@ -140,6 +145,7 @@ type MetricSample struct {
 	Time        time.Time
 	FirstByteMS *int64
 	Concurrency int
+	QueueDepth  int
 	Error       bool
 }
 
@@ -149,6 +155,7 @@ type metricBucketRecord struct {
 	FirstByteTotalMS int64     `json:"firstByteTotalMs"`
 	FirstByteSamples int       `json:"firstByteSamples"`
 	MaxConcurrency   int       `json:"maxConcurrency"`
+	MaxQueueDepth    int       `json:"maxQueueDepth"`
 	Errors           int       `json:"errors"`
 }
 
@@ -156,6 +163,7 @@ type MetricPoint struct {
 	Time        time.Time `json:"time"`
 	FirstByteMS *int64    `json:"firstByteMs,omitempty"`
 	Concurrency int       `json:"concurrency"`
+	QueueDepth  int       `json:"queueDepth"`
 	Errors      int       `json:"errors"`
 	Requests    int       `json:"requests"`
 }
@@ -249,6 +257,18 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 	}
 	if err := validateOptionalURL(cfg.DefaultProxyURL, "default proxy URL"); err != nil {
 		return err
+	}
+	if cfg.GlobalMaxConcurrency < 0 {
+		return fmt.Errorf("global max concurrency cannot be negative")
+	}
+	if cfg.MaxQueueSize < 0 {
+		return fmt.Errorf("max queue size cannot be negative")
+	}
+	if cfg.QueueTimeoutMS < 0 {
+		return fmt.Errorf("queue timeout cannot be negative")
+	}
+	if cfg.KeyMaxRequestsPerMinute < 0 {
+		return fmt.Errorf("key max requests per minute cannot be negative")
 	}
 	cfg.ProxyMode = normalizeProxyMode(cfg.ProxyMode)
 	cfg.IPAllowlist = normalizeRules(cfg.IPAllowlist)
@@ -572,7 +592,7 @@ func (s *Store) RestoreAllKeys() (int, error) {
 	return restored, err
 }
 
-func (s *Store) RecordSuccess(id string) error {
+func (s *Store) RecordSuccess(id string, responseMS ...int64) error {
 	key, err := s.GetKey(id)
 	if err != nil {
 		return err
@@ -580,11 +600,15 @@ func (s *Store) RecordSuccess(id string) error {
 	key.ConsecutiveErrors = 0
 	key.LastError = ""
 	key.LastUsedAt = time.Now().UTC()
+	if len(responseMS) > 0 {
+		value := responseMS[0]
+		key.LastResponseMS = &value
+	}
 	_, err = s.saveKey(key)
 	return err
 }
 
-func (s *Store) RecordFailure(id, message string, balanceDepleted bool) (Key, error) {
+func (s *Store) RecordFailure(id, message string, balanceDepleted bool, responseMS ...int64) (Key, error) {
 	key, err := s.GetKey(id)
 	if err != nil {
 		return Key{}, err
@@ -592,6 +616,10 @@ func (s *Store) RecordFailure(id, message string, balanceDepleted bool) (Key, er
 	key.ConsecutiveErrors++
 	key.LastError = message
 	key.LastUsedAt = time.Now().UTC()
+	if len(responseMS) > 0 {
+		value := responseMS[0]
+		key.LastResponseMS = &value
+	}
 	if balanceDepleted {
 		key.BalanceDepleted = true
 		key.Paused = true
@@ -639,6 +667,9 @@ func (s *Store) RecordMetric(keyID string, sample MetricSample) error {
 		}
 		if sample.Concurrency > record.MaxConcurrency {
 			record.MaxConcurrency = sample.Concurrency
+		}
+		if sample.QueueDepth > record.MaxQueueDepth {
+			record.MaxQueueDepth = sample.QueueDepth
 		}
 		if sample.Error {
 			record.Errors++
@@ -688,6 +719,9 @@ func (s *Store) ListMetrics(granularity string, now time.Time) ([]MetricPoint, e
 			if record.MaxConcurrency > next.MaxConcurrency {
 				next.MaxConcurrency = record.MaxConcurrency
 			}
+			if record.MaxQueueDepth > next.MaxQueueDepth {
+				next.MaxQueueDepth = record.MaxQueueDepth
+			}
 			next.Errors += record.Errors
 			aggregated[key] = next
 			return nil
@@ -707,6 +741,7 @@ func (s *Store) ListMetrics(granularity string, now time.Time) ([]MetricPoint, e
 			Time:        record.Time,
 			FirstByteMS: firstByte,
 			Concurrency: record.MaxConcurrency,
+			QueueDepth:  record.MaxQueueDepth,
 			Errors:      record.Errors,
 			Requests:    record.Requests,
 		})

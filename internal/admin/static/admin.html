@@ -379,13 +379,36 @@
     }
     .chart-wrap {
       position: relative;
-      min-height: 380px;
+      min-height: 460px;
       padding: 12px;
     }
     #monitorChart {
       display: block;
       width: 100%;
-      height: 360px;
+      height: 440px;
+    }
+    .chart-crosshair {
+      position: absolute;
+      width: 1px;
+      background: rgba(15, 23, 42, .35);
+      pointer-events: none;
+      transform: translateX(-0.5px);
+      z-index: 2;
+    }
+    .chart-hover-dots {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .chart-hover-dot {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 2px solid #fff;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 0 1px rgba(15, 23, 42, .25);
     }
     .chart-empty {
       position: absolute;
@@ -689,6 +712,7 @@
                 <th>状态</th>
                 <th>并发</th>
                 <th>首字响应</th>
+                <th>总响应</th>
                 <th>错误</th>
                 <th>最后使用</th>
                 <th style="text-align:right">操作</th>
@@ -730,9 +754,9 @@
                   <th>节点</th>
                   <th>代理地址</th>
                   <th>状态</th>
-                  <th>负载</th>
-                  <th>请求</th>
-                  <th>流量</th>
+                  <th>连接/上限</th>
+                  <th>代理请求</th>
+                  <th>请求/响应流量</th>
                   <th>最后上报</th>
                   <th>错误</th>
                   <th style="text-align:right">操作</th>
@@ -761,11 +785,14 @@
           <div class="chart-legend">
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#2563eb"></i>首字响应 ms</span>
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#0f766e"></i>并发数</span>
+            <span class="legend-item"><i class="legend-swatch" style="--legend-color:#a855f7"></i>排队数</span>
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#b42318"></i>错误数</span>
-            <span class="muted">三条线分泳道展示，避免毫秒值压扁并发/错误</span>
+            <span class="muted">分泳道展示，Y 轴基于 p95 截断，超出值在线上方以红色三角标注</span>
           </div>
           <div class="chart-wrap">
             <canvas id="monitorChart"></canvas>
+            <div id="chartCrosshair" class="chart-crosshair hidden"></div>
+            <div id="chartHoverDots" class="chart-hover-dots hidden"></div>
             <div id="monitorEmpty" class="chart-empty hidden">暂无最近 7 天监控数据</div>
             <div id="monitorTooltip" class="chart-tooltip hidden"></div>
           </div>
@@ -799,6 +826,18 @@
               <option value="round_robin">轮询</option>
               <option value="key_binding">绑定 Key</option>
             </select>
+          </label>
+          <label>总并发
+            <input id="globalMaxConcurrency" type="number" min="0" step="1" placeholder="0 表示不限">
+          </label>
+          <label>最大排队数
+            <input id="maxQueueSize" type="number" min="0" step="1" placeholder="0 表示不排队">
+          </label>
+          <label>排队超时 ms
+            <input id="queueTimeoutMs" type="number" min="0" step="1000" placeholder="30000">
+          </label>
+          <label>单 Key 每分钟上限
+            <input id="keyMaxRequestsPerMinute" type="number" min="0" step="1" placeholder="0 表示不限制">
           </label>
           <label class="span-2">请求 IP 白名单
             <textarea id="ipAllowlist" placeholder="为空表示不限制&#10;127.0.0.1&#10;192.*"></textarea>
@@ -974,6 +1013,7 @@
     let metricsGranularity = "minute";
     let metricItems = [];
     let chartHitPoints = [];
+    let chartGeometry = null;
     let proxies = [];
     let proxyStats = { total: 0, online: 0, disabled: 0, connections: 0 };
     let editingProxyId = "";
@@ -1134,6 +1174,10 @@
       setValue("defaultProxyUrl", cfg.defaultProxyUrl || "");
       setValue("proxyPoolEnabled", String(Boolean(cfg.proxyPoolEnabled)));
       setValue("proxyMode", cfg.proxyMode || "round_robin");
+      setValue("globalMaxConcurrency", String(cfg.globalMaxConcurrency || 0));
+      setValue("maxQueueSize", String(cfg.maxQueueSize || 0));
+      setValue("queueTimeoutMs", String(cfg.queueTimeoutMs || 0));
+      setValue("keyMaxRequestsPerMinute", String(cfg.keyMaxRequestsPerMinute || 0));
       setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
       setValue("ipBlocklist", joinRules(cfg.ipBlocklist || []));
     }
@@ -1149,6 +1193,10 @@
             defaultProxyUrl: value("defaultProxyUrl"),
             proxyPoolEnabled: value("proxyPoolEnabled") === "true",
             proxyMode: value("proxyMode") || "round_robin",
+            globalMaxConcurrency: Number(value("globalMaxConcurrency") || "0"),
+            maxQueueSize: Number(value("maxQueueSize") || "0"),
+            queueTimeoutMs: Number(value("queueTimeoutMs") || "0"),
+            keyMaxRequestsPerMinute: Number(value("keyMaxRequestsPerMinute") || "0"),
             ipAllowlist: splitRules(value("ipAllowlist")),
             ipBlocklist: splitRules(value("ipBlocklist"))
           })
@@ -1190,7 +1238,7 @@
           <td class="truncate">${escapeHtml(p.proxyUrl || "自动推导中")}</td>
           <td>${proxyStatusPill(p)}</td>
           <td>${p.currentConnections || 0}/${p.maxConcurrency || 100}</td>
-          <td>${p.totalRequests || 0}<div class="muted">失败 ${p.failedRequests || 0}</div></td>
+          <td>${p.totalRequests || 0}<div class="muted">代理失败 ${p.failedRequests || 0}</div></td>
           <td>${formatBytes(p.bytesIn || 0)} / ${formatBytes(p.bytesOut || 0)}</td>
           <td>${formatDateTime(p.lastReportAt)}</td>
           <td class="truncate">${escapeHtml(p.lastError || "-")}</td>
@@ -1637,7 +1685,7 @@
       node.innerHTML = `
         <div class="capture-meta">
           ${captureField("响应状态", String(result.statusCode || "-"))}
-          ${captureField("耗时", result.durationMs != null ? `${result.durationMs} ms` : "-")}
+          ${captureField("耗时", result.durationMs != null ? formatDuration(result.durationMs) : "-")}
           ${captureField("结果", result.error ? "失败" : "完成")}
         </div>
         ${captureSection("响应头", formatJSON(result.responseHeader || {}))}
@@ -1651,7 +1699,7 @@
         <div class="capture-meta">
           ${captureField("请求地址", data.requestUrl || "-")}
           ${captureField("响应状态", String(data.statusCode || "-"))}
-          ${captureField("耗时", data.durationMs != null ? `${data.durationMs} ms` : "-")}
+          ${captureField("耗时", data.durationMs != null ? formatDuration(data.durationMs) : "-")}
         </div>
         ${captureSection("请求头", formatJSON(data.requestHeader || {}))}
         ${captureSection("请求数据", formatPayload(data.requestBody))}
@@ -1672,7 +1720,7 @@
     function timelineItemHtml(event) {
       const meta = [];
       if (event.attempt) meta.push(`第 ${event.attempt} 次`);
-      if (event.durationMs != null && event.durationMs !== 0) meta.push(`${event.durationMs} ms`);
+      if (event.durationMs != null && event.durationMs !== 0) meta.push(formatDuration(event.durationMs));
       const suffix = meta.length ? ` · ${meta.join(" · ")}` : "";
       const elapsed = event.elapsedMs != null ? `+${event.elapsedMs}ms` : "-";
       return `<em class="progress-time">${escapeHtml(elapsed)}</em><strong>${escapeHtml(event.step || "-")}</strong><span>${escapeHtml(event.message || "")}${escapeHtml(suffix)}${event.error ? `<br><small>${escapeHtml(event.error)}</small>` : ""}</span>`;
@@ -1732,7 +1780,8 @@
           <td class="truncate">${escapeHtml(k.proxyUrl || "使用全局")}</td>
           <td>${statusPill(k)}</td>
           <td>${k.currentConcurrency || 0}/${k.maxConcurrency}</td>
-          <td>${formatFirstByte(k.lastFirstByteMs)}</td>
+          <td>${formatDuration(k.lastFirstByteMs)}</td>
+          <td>${formatDuration(k.lastResponseMs)}</td>
           <td><span>${k.consecutiveErrors || 0}</span>${k.lastError ? `<div class="muted truncate">${escapeHtml(k.lastError)}</div>` : ""}</td>
           <td>${formatDateTime(k.lastUsedAt)}</td>
           <td>
@@ -1825,40 +1874,56 @@
 
       const dpr = window.devicePixelRatio || 1;
       const width = Math.max(640, Math.floor(canvas.clientWidth || 640));
-      const height = Math.max(320, Math.floor(canvas.clientHeight || 360));
+      const height = Math.max(420, Math.floor(canvas.clientHeight || 440));
       canvas.width = Math.floor(width * dpr);
       canvas.height = Math.floor(height * dpr);
       const ctx = canvas.getContext("2d");
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      const pad = { top: 18, right: 18, bottom: 40, left: 72 };
+      const pad = { top: 18, right: 18, bottom: 40, left: 76 };
       const plotWidth = width - pad.left - pad.right;
       const plotHeight = height - pad.top - pad.bottom;
       const series = [
         { key: "firstByteMs", label: "首字响应", unit: "ms", color: "#2563eb", empty: true },
         { key: "concurrency", label: "并发数", unit: "", color: "#0f766e" },
+        { key: "queueDepth", label: "排队数", unit: "", color: "#a855f7" },
         { key: "errors", label: "错误数", unit: "", color: "#b42318" }
       ];
       const lanes = buildChartLanes(series, pad, plotHeight, points);
 
       drawChartGrid(ctx, width, height, pad, plotWidth, lanes, points);
+      chartGeometry = { pad, plotWidth, plotHeight, width, height, lanes };
       if (points.length === 0) return;
       lanes.forEach(lane => drawMetricSeries(ctx, points, lane, pad, plotWidth));
     }
 
+    function computeLaneScale(values) {
+      const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
+      if (!finite.length) return 1;
+      const idx = Math.min(finite.length - 1, Math.floor(finite.length * 0.95));
+      const p95 = finite[idx];
+      return niceCeil(Math.max(1, p95 * 1.2));
+    }
+
+    function niceCeil(value) {
+      if (value <= 1) return 1;
+      const mag = Math.pow(10, Math.floor(Math.log10(value)));
+      const norm = value / mag;
+      const nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+      return nice * mag;
+    }
+
     function buildChartLanes(series, pad, plotHeight, points) {
-      const gap = 22;
+      const gap = 18;
       const laneHeight = (plotHeight - gap * (series.length - 1)) / series.length;
       return series.map((item, index) => {
-        const values = points
-          .map(point => Number(point[item.key]))
-          .filter(value => Number.isFinite(value));
+        const values = points.map(point => Number(point[item.key]));
         return {
           ...item,
           top: pad.top + index * (laneHeight + gap),
           height: laneHeight,
-          scaleMax: Math.max(1, ...values)
+          scaleMax: computeLaneScale(values)
         };
       });
     }
@@ -1886,6 +1951,7 @@
         ctx.fillText(lane.label, pad.left - 10, lane.top + lane.height / 2);
         ctx.fillStyle = "#667085";
         ctx.fillText(formatLaneValue(lane.scaleMax, lane.unit), pad.left - 10, lane.top + 10);
+        ctx.fillText(formatLaneValue(lane.scaleMax / 2, lane.unit), pad.left - 10, lane.top + lane.height / 2 + 0.5);
         ctx.fillText("0", pad.left - 10, lane.top + lane.height - 8);
       });
 
@@ -1906,18 +1972,24 @@
       ctx.lineCap = "round";
       let started = false;
       const dots = [];
+      const outliers = [];
       ctx.beginPath();
       points.forEach((point, index) => {
         const raw = point[lane.key];
-        if (lane.empty && !Number.isFinite(Number(raw))) {
+        const numeric = Number(raw);
+        if (lane.empty && !Number.isFinite(numeric)) {
           started = false;
+          addChartHitPoint(point, index, pointX(pad, plotWidth, points.length, index), null);
           return;
         }
-        const value = Number(raw || 0);
-        const x = pad.left + (points.length === 1 ? plotWidth / 2 : plotWidth * index / (points.length - 1));
-        const y = lane.top + lane.height - (Math.min(value, lane.scaleMax) / lane.scaleMax * lane.height);
+        const value = Number.isFinite(numeric) ? numeric : 0;
+        const x = pointX(pad, plotWidth, points.length, index);
+        const exceeded = value > lane.scaleMax;
+        const clamped = Math.min(value, lane.scaleMax);
+        const y = lane.top + lane.height - (clamped / lane.scaleMax * lane.height);
         dots.push({ x, y });
-        addChartHitPoint(point, index, x);
+        if (exceeded) outliers.push({ x, value });
+        addChartHitPoint(point, index, x, { laneKey: lane.key, color: lane.color, x, y, value, exceeded });
         if (!started) {
           ctx.moveTo(x, y);
           started = true;
@@ -1932,10 +2004,25 @@
         ctx.arc(dot.x, dot.y, 3.5, 0, Math.PI * 2);
         ctx.fill();
       });
+      outliers.forEach(o => {
+        ctx.fillStyle = "#dc2626";
+        ctx.beginPath();
+        ctx.moveTo(o.x, lane.top - 1);
+        ctx.lineTo(o.x - 5, lane.top + 7);
+        ctx.lineTo(o.x + 5, lane.top + 7);
+        ctx.closePath();
+        ctx.fill();
+      });
     }
 
-    function addChartHitPoint(point, index, x) {
-      if (!chartHitPoints[index]) chartHitPoints[index] = { point, x };
+    function pointX(pad, plotWidth, total, index) {
+      if (total <= 1) return pad.left + plotWidth / 2;
+      return pad.left + plotWidth * index / (total - 1);
+    }
+
+    function addChartHitPoint(point, index, x, dot) {
+      if (!chartHitPoints[index]) chartHitPoints[index] = { point, x, dots: [] };
+      if (dot) chartHitPoints[index].dots.push(dot);
     }
 
     function formatLaneValue(value, unit) {
@@ -1944,15 +2031,16 @@
     }
 
     function showMonitorTooltip(event) {
-      if (!chartHitPoints.length) return hideMonitorTooltip();
+      if (!chartHitPoints.length || !chartGeometry) return hideMonitorTooltip();
       const canvas = el("monitorChart");
       const rect = canvas.getBoundingClientRect();
+      const cssScale = chartGeometry.width > 0 ? rect.width / chartGeometry.width : 1;
       const mouseX = event.clientX - rect.left;
       let nearest = null;
       let distance = Infinity;
       chartHitPoints.forEach(hit => {
         if (!hit) return;
-        const nextDistance = Math.abs(hit.x - mouseX);
+        const nextDistance = Math.abs(hit.x * cssScale - mouseX);
         if (nextDistance < distance) {
           nearest = hit;
           distance = nextDistance;
@@ -1961,23 +2049,55 @@
       if (!nearest || distance > 48) return hideMonitorTooltip();
 
       const point = nearest.point;
+      const exceededByKey = {};
+      (nearest.dots || []).forEach(dot => { exceededByKey[dot.laneKey] = dot.exceeded; });
+      const tipValue = (value, unit, key) => {
+        const text = formatTooltipValue(value, unit);
+        return exceededByKey[key] ? `${text} <span style="color:#dc2626" title="超过 p95 区间">⚠</span>` : text;
+      };
       const tooltip = el("monitorTooltip");
       tooltip.innerHTML = `
         <strong>${escapeHtml(formatTooltipTime(point.time))}</strong>
-        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#2563eb"></i>首字响应</span><b>${formatTooltipValue(point.firstByteMs, "ms")}</b></div>
-        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#0f766e"></i>并发数</span><b>${formatTooltipValue(point.concurrency, "")}</b></div>
-        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#b42318"></i>错误数</span><b>${formatTooltipValue(point.errors, "")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#2563eb"></i>首字响应</span><b>${tipValue(point.firstByteMs, "ms", "firstByteMs")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#0f766e"></i>并发数</span><b>${tipValue(point.concurrency, "", "concurrency")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#a855f7"></i>排队数</span><b>${tipValue(point.queueDepth, "", "queueDepth")}</b></div>
+        <div class="tip-row"><span class="tip-label"><i style="--tip-color:#b42318"></i>错误数</span><b>${tipValue(point.errors, "", "errors")}</b></div>
         <div class="tip-row"><span class="tip-label">请求数</span><b>${formatTooltipValue(point.requests, "")}</b></div>
       `;
       tooltip.classList.remove("hidden");
-      const left = Math.min(Math.max(nearest.x + 12, 95), rect.width - 95);
+      const left = Math.min(Math.max(nearest.x * cssScale + 12, 95), rect.width - 95);
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${event.clientY - rect.top}px`;
+
+      const wrap = canvas.parentElement;
+      const wrapRect = wrap.getBoundingClientRect();
+      const canvasLeft = rect.left - wrapRect.left;
+      const canvasTop = rect.top - wrapRect.top;
+      const crosshair = el("chartCrosshair");
+      crosshair.style.left = `${canvasLeft + nearest.x * cssScale}px`;
+      crosshair.style.top = `${canvasTop + chartGeometry.pad.top * cssScale}px`;
+      crosshair.style.height = `${(chartGeometry.plotHeight) * cssScale}px`;
+      crosshair.classList.remove("hidden");
+
+      const dotsHost = el("chartHoverDots");
+      dotsHost.innerHTML = (nearest.dots || []).map(dot => {
+        const dx = canvasLeft + dot.x * cssScale;
+        const dy = canvasTop + dot.y * cssScale;
+        return `<span class="chart-hover-dot" style="left:${dx}px;top:${dy}px;background:${dot.color}"></span>`;
+      }).join("");
+      dotsHost.classList.remove("hidden");
     }
 
     function hideMonitorTooltip() {
       const tooltip = el("monitorTooltip");
       if (tooltip) tooltip.classList.add("hidden");
+      const crosshair = el("chartCrosshair");
+      if (crosshair) crosshair.classList.add("hidden");
+      const dotsHost = el("chartHoverDots");
+      if (dotsHost) {
+        dotsHost.classList.add("hidden");
+        dotsHost.innerHTML = "";
+      }
     }
 
     function formatTooltipValue(value, unit) {
@@ -2009,9 +2129,16 @@
       return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
 
+    function formatDuration(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "<span class=\"muted\">-</span>";
+      if (n < 1000) return `${Math.round(n)} ms`;
+      if (n < 60000) return `${(n / 1000).toFixed(1)} s`;
+      return `${(n / 60000).toFixed(1)} min`;
+    }
+
     function formatFirstByte(value) {
-      if (!Number.isFinite(Number(value))) return "<span class=\"muted\">-</span>";
-      return `${Math.round(Number(value))} ms`;
+      return formatDuration(value);
     }
 
     function formatDateTime(value) {

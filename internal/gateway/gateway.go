@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"api-fucker/internal/store"
@@ -33,6 +34,8 @@ var (
 	errNoAvailableKey        = errors.New("no available upstream key")
 	errNoAvailableProxy      = errors.New("no available proxy node")
 	errUpstreamNotConfigured = errors.New("upstream base URL is not configured")
+	errGlobalQueueFull       = errors.New("apiFucker超过最大排队数量")
+	errGlobalQueueTimeout    = errors.New("apiFucker排队等待超时")
 )
 
 type Gateway struct {
@@ -43,9 +46,21 @@ type Gateway struct {
 	proxyRoundRobin int
 	inflight        map[string]int
 	proxyInflight   map[string]int
+	keyMinute       map[string]*minuteCounter
 	clients         map[string]*http.Client
 	newClient       func(proxyURL string) (*http.Client, error)
 	proxyNodeToken  string
+
+	queueMu       sync.Mutex
+	globalRunning int
+	globalQueued  int
+	queueNotify   chan struct{}
+	queuePeak     int32
+}
+
+type minuteCounter struct {
+	windowStart time.Time
+	count       int
 }
 
 type selectedKey struct {
@@ -91,9 +106,11 @@ func New(st *store.Store, _ *http.Client, proxyNodeToken ...string) *Gateway {
 		store:          st,
 		inflight:       make(map[string]int),
 		proxyInflight:  make(map[string]int),
+		keyMinute:      make(map[string]*minuteCounter),
 		clients:        make(map[string]*http.Client),
 		newClient:      httpClientForProxy,
 		proxyNodeToken: token,
+		queueNotify:    make(chan struct{}),
 	}
 }
 
@@ -116,6 +133,20 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	isStream := upstreamPath == chatPath && requestWantsStream(body)
+	if upstreamPath == chatPath {
+		cfg, _ := g.store.GlobalConfig()
+		releaseGlobal, err := g.acquireGlobalSlot(r.Context(), cfg)
+		if err != nil {
+			status := http.StatusGatewayTimeout
+			if errors.Is(err, errGlobalQueueFull) {
+				status = http.StatusTooManyRequests
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		defer releaseGlobal()
+	}
+
 	selected, err := g.acquireKey()
 	if err != nil {
 		status := http.StatusTooManyRequests
@@ -154,20 +185,117 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Time:        capture.Time,
 			FirstByteMS: firstByteElapsedMS(capture.NetworkEvents),
 			Concurrency: g.totalConcurrency(),
+			QueueDepth:  g.consumeQueuePeak(),
 			Error:       forwardErr != nil || status >= 400,
 		})
 
 		if forwardErr != nil {
-			_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false)
+			_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false, capture.DurationMS)
 			return
 		}
 		if status >= 400 {
 			msg := truncate(string(respBody), 1000)
-			_, _ = g.store.RecordFailure(selected.key.ID, msg, looksBalanceDepleted(status, respBody))
+			_, _ = g.store.RecordFailure(selected.key.ID, msg, looksBalanceDepleted(status, respBody), capture.DurationMS)
 			return
 		}
-		_ = g.store.RecordSuccess(selected.key.ID)
+		_ = g.store.RecordSuccess(selected.key.ID, capture.DurationMS)
 	}
+}
+
+func (g *Gateway) acquireGlobalSlot(ctx context.Context, cfg store.GlobalConfig) (func(), error) {
+	maxConcurrency := cfg.GlobalMaxConcurrency
+	if maxConcurrency <= 0 {
+		return func() {}, nil
+	}
+	queueTimeout := time.Duration(cfg.QueueTimeoutMS) * time.Millisecond
+	if queueTimeout <= 0 {
+		queueTimeout = 30 * time.Second
+	}
+
+	g.queueMu.Lock()
+	if g.globalRunning < maxConcurrency {
+		g.globalRunning++
+		g.queueMu.Unlock()
+		return g.releaseGlobalSlot, nil
+	}
+	if cfg.MaxQueueSize <= 0 || g.globalQueued >= cfg.MaxQueueSize {
+		g.queueMu.Unlock()
+		return nil, errGlobalQueueFull
+	}
+	g.globalQueued++
+	g.observeQueuePeakLocked()
+	timer := time.NewTimer(queueTimeout)
+	defer timer.Stop()
+
+	for {
+		notify := g.queueNotify
+		g.queueMu.Unlock()
+		select {
+		case <-ctx.Done():
+			g.queueMu.Lock()
+			g.globalQueued--
+			g.signalGlobalQueueLocked()
+			g.queueMu.Unlock()
+			return nil, errGlobalQueueTimeout
+		case <-timer.C:
+			g.queueMu.Lock()
+			g.globalQueued--
+			g.signalGlobalQueueLocked()
+			g.queueMu.Unlock()
+			return nil, errGlobalQueueTimeout
+		case <-notify:
+			g.queueMu.Lock()
+			if g.globalRunning < maxConcurrency {
+				g.globalQueued--
+				g.globalRunning++
+				g.queueMu.Unlock()
+				return g.releaseGlobalSlot, nil
+			}
+		}
+	}
+}
+
+func (g *Gateway) releaseGlobalSlot() {
+	g.queueMu.Lock()
+	defer g.queueMu.Unlock()
+	if g.globalRunning > 0 {
+		g.globalRunning--
+	}
+	g.signalGlobalQueueLocked()
+}
+
+func (g *Gateway) signalGlobalQueueLocked() {
+	close(g.queueNotify)
+	g.queueNotify = make(chan struct{})
+}
+
+// observeQueuePeakLocked records the current queue depth as a new peak if it
+// exceeds the value seen since the last sample read. Caller must hold queueMu.
+func (g *Gateway) observeQueuePeakLocked() {
+	current := int32(g.globalQueued)
+	for {
+		prev := atomic.LoadInt32(&g.queuePeak)
+		if current <= prev {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&g.queuePeak, prev, current) {
+			return
+		}
+	}
+}
+
+// QueueDepth returns the current number of requests waiting in the global
+// queue. This is a live snapshot used by the admin metrics endpoint.
+func (g *Gateway) QueueDepth() int {
+	g.queueMu.Lock()
+	defer g.queueMu.Unlock()
+	return g.globalQueued
+}
+
+// consumeQueuePeak returns the highest queue depth seen since the previous
+// call and resets the counter to zero. Used per RecordMetric sample.
+func (g *Gateway) consumeQueuePeak() int {
+	return int(atomic.SwapInt32(&g.queuePeak, 0))
 }
 
 func routeRequest(r *http.Request) (string, string, error) {
@@ -191,6 +319,26 @@ func (g *Gateway) CurrentConcurrency() map[string]int {
 	return out
 }
 
+// pruneKeyMinuteLocked drops minuteCounter entries whose window has rolled
+// over and any entries belonging to keys that no longer exist. Caller must
+// hold g.mu. The post-condition is that every remaining entry corresponds to
+// a still-existing key whose current window has not yet elapsed, which lets
+// the candidate loop test only `count >= rpmLimit`.
+func (g *Gateway) pruneKeyMinuteLocked(keys []store.Key, now time.Time) {
+	if len(g.keyMinute) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		existing[k.ID] = struct{}{}
+	}
+	for id, mc := range g.keyMinute {
+		if _, ok := existing[id]; !ok || now.Sub(mc.windowStart) >= time.Minute {
+			delete(g.keyMinute, id)
+		}
+	}
+}
+
 func (g *Gateway) totalConcurrency() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -212,6 +360,10 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	now := time.Now()
+	rpmLimit := cfg.KeyMaxRequestsPerMinute
+	g.pruneKeyMinuteLocked(keys, now)
+
 	candidates := make([]store.Key, 0, len(keys))
 	for _, key := range keys {
 		if !key.Enabled || key.Paused || key.BalanceDepleted {
@@ -219,6 +371,11 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		}
 		if g.inflight[key.ID] >= key.MaxConcurrency {
 			continue
+		}
+		if rpmLimit > 0 {
+			if mc := g.keyMinute[key.ID]; mc != nil && mc.count >= rpmLimit {
+				continue
+			}
 		}
 		candidates = append(candidates, key)
 	}
@@ -254,6 +411,15 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		proxyURL = proxyURLWithToken(node.ProxyURL, g.proxyNodeToken)
 		proxyNodeID = node.ID
 		g.proxyInflight[node.ID]++
+	}
+
+	if rpmLimit > 0 {
+		mc := g.keyMinute[key.ID]
+		if mc == nil || now.Sub(mc.windowStart) >= time.Minute {
+			g.keyMinute[key.ID] = &minuteCounter{windowStart: now, count: 1}
+		} else {
+			mc.count++
+		}
 	}
 	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL, proxyNodeID: proxyNodeID}, nil
 }
@@ -450,11 +616,11 @@ func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg st
 		emitProgress(progress, TestProgressEvent{Step: "record", Message: "写入测试结果和 Key 状态"})
 		_ = g.store.SaveCapture(capture)
 		if forwardErr != nil {
-			_, _ = g.store.RecordFailure(key.ID, forwardErr.Error(), false)
+			_, _ = g.store.RecordFailure(key.ID, forwardErr.Error(), false, capture.DurationMS)
 		} else if status >= 400 {
-			_, _ = g.store.RecordFailure(key.ID, truncate(string(respBody), 1000), looksBalanceDepleted(status, respBody))
+			_, _ = g.store.RecordFailure(key.ID, truncate(string(respBody), 1000), looksBalanceDepleted(status, respBody), capture.DurationMS)
 		} else {
-			_ = g.store.RecordSuccess(key.ID)
+			_ = g.store.RecordSuccess(key.ID, capture.DurationMS)
 		}
 	}
 	result := UpstreamTestResult{
@@ -781,10 +947,7 @@ func shouldRetryRequest(ctx context.Context, attempt int, status int, err error)
 	if err != nil {
 		return true
 	}
-	return status == http.StatusRequestTimeout ||
-		status == http.StatusBadGateway ||
-		status == http.StatusServiceUnavailable ||
-		status == http.StatusGatewayTimeout
+	return false
 }
 
 func waitRetryDelay(ctx context.Context, attempt int) error {
