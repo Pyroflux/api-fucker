@@ -244,12 +244,58 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	granularity := r.URL.Query().Get("granularity")
 	now := time.Now().UTC()
-	points, err := h.store.ListMetrics(granularity, now)
-	if err == nil {
+	to := parseQueryTime(r.URL.Query().Get("to"), now)
+	from := parseQueryTime(r.URL.Query().Get("from"), defaultMetricsFrom(granularity, to))
+	if span := to.Sub(from); span > metricsRangeCap {
+		from = to.Add(-metricsRangeCap)
+	}
+	if from.After(to) {
+		from = to
+	}
+	points, err := h.store.ListMetrics(granularity, from, to)
+	if err == nil && !to.Before(now.Add(-granularityUnit(granularity))) {
 		points = appendLiveConcurrencyPoint(points, granularity, now, totalInflight(h.currentConcurrency()))
 		points = appendLiveQueueDepthPoint(points, granularity, now, h.queueDepth())
 	}
 	respond(w, map[string]any{"items": points}, err)
+}
+
+const metricsRangeCap = 7 * 24 * time.Hour
+
+func parseQueryTime(raw string, fallback time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC()
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return time.Unix(secs, 0).UTC()
+	}
+	return fallback
+}
+
+func defaultMetricsFrom(granularity string, to time.Time) time.Time {
+	switch strings.TrimSpace(granularity) {
+	case "hour":
+		return to.Add(-24 * time.Hour)
+	case "day":
+		return to.Add(-metricsRangeCap)
+	default:
+		return to.Add(-time.Hour)
+	}
+}
+
+func granularityUnit(granularity string) time.Duration {
+	switch strings.TrimSpace(granularity) {
+	case "hour":
+		return time.Hour
+	case "day":
+		return 24 * time.Hour
+	default:
+		return time.Minute
+	}
 }
 
 func (h *Handler) proxies(w http.ResponseWriter, r *http.Request) {

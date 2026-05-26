@@ -247,7 +247,7 @@ func TestMetricsAggregateAndTrackFirstByte(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	points, err := st.ListMetrics("minute", now.Add(time.Minute))
+	points, err := st.ListMetrics("minute", time.Time{}, now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestRecordMetricAggregatesQueueDepth(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	points, err := st.ListMetrics("minute", now.Add(time.Minute))
+	points, err := st.ListMetrics("minute", time.Time{}, now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +333,43 @@ func TestRecordMetricAggregatesQueueDepth(t *testing.T) {
 	}
 	if points[0].QueueDepth != 7 {
 		t.Fatalf("queueDepth = %d, want 7 (max across bucket)", points[0].QueueDepth)
+	}
+}
+
+func TestListMetricsHonoursExplicitRange(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	for _, offset := range []time.Duration{-3 * time.Hour, -90 * time.Minute, -10 * time.Minute, -30 * time.Second} {
+		if err := st.RecordMetric(key.ID, MetricSample{Time: base.Add(offset), Concurrency: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Only the last 60min window should match.
+	points, err := st.ListMetrics("minute", base.Add(-60*time.Minute), base.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 2 {
+		t.Fatalf("got %d points, want 2 (last hour only): %+v", len(points), points)
+	}
+
+	// `from` older than 7d is clamped to the retention floor.
+	all, err := st.ListMetrics("minute", base.Add(-30*24*time.Hour), base.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("clamped-range got %d points, want 4 (full 7d retention)", len(all))
 	}
 }
 

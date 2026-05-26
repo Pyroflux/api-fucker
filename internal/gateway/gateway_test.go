@@ -80,7 +80,7 @@ func TestGatewayForwardsAndRecordsCapture(t *testing.T) {
 	if updated.LastFirstByteMS == nil {
 		t.Fatalf("expected last first byte to be recorded: %+v", updated)
 	}
-	points, err := st.ListMetrics("minute", time.Now().UTC().Add(time.Minute))
+	points, err := st.ListMetrics("minute", time.Time{}, time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestGatewayForwardsModelsList(t *testing.T) {
 	if _, err := st.GetCapture(key.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("models response should not be captured, got %v", err)
 	}
-	points, err := st.ListMetrics("minute", time.Now().UTC().Add(time.Minute))
+	points, err := st.ListMetrics("minute", time.Time{}, time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}

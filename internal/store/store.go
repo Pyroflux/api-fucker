@@ -693,12 +693,19 @@ func (s *Store) RecordMetric(keyID string, sample MetricSample) error {
 	})
 }
 
-func (s *Store) ListMetrics(granularity string, now time.Time) ([]MetricPoint, error) {
-	now = now.UTC()
-	if now.IsZero() {
-		now = time.Now().UTC()
+func (s *Store) ListMetrics(granularity string, from, to time.Time) ([]MetricPoint, error) {
+	to = to.UTC()
+	if to.IsZero() {
+		to = time.Now().UTC()
 	}
-	start := now.Add(-metricsMaxAge)
+	from = from.UTC()
+	retentionFloor := to.Add(-metricsMaxAge)
+	if from.IsZero() || from.Before(retentionFloor) {
+		from = retentionFloor
+	}
+	if from.After(to) {
+		from = to
+	}
 	truncate := metricTruncator(granularity)
 	aggregated := make(map[int64]metricBucketRecord)
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -709,7 +716,7 @@ func (s *Store) ListMetrics(granularity string, now time.Time) ([]MetricPoint, e
 				return err
 			}
 			record.Time = record.Time.UTC()
-			if record.Time.Before(start) || record.Time.After(now) {
+			if record.Time.Before(from) || record.Time.After(to) {
 				return nil
 			}
 			pointTime := truncate(record.Time)

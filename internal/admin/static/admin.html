@@ -379,14 +379,24 @@
     }
     .chart-wrap {
       position: relative;
-      min-height: 460px;
+      min-height: 660px;
       padding: 12px;
     }
     #monitorChart {
       display: block;
       width: 100%;
-      height: 440px;
+      height: 640px;
     }
+    .range-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .range-box label { display: inline-flex; align-items: center; gap: 4px; }
+    .range-box input { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
     .chart-crosshair {
       position: absolute;
       width: 1px;
@@ -780,6 +790,12 @@
               <button id="granularityHour" type="button" onclick="changeMetricsGranularity('hour')">时</button>
               <button id="granularityDay" type="button" onclick="changeMetricsGranularity('day')">天</button>
             </div>
+            <div id="metricsRangeBox" class="range-box hidden">
+              <label>从 <input type="datetime-local" id="metricsFrom"></label>
+              <label>到 <input type="datetime-local" id="metricsTo"></label>
+              <button class="secondary" type="button" onclick="applyMetricsRange()">应用</button>
+              <button class="ghost" type="button" onclick="resetMetricsRange()">最新</button>
+            </div>
           </div>
         </div>
         <div class="panel-body">
@@ -1015,6 +1031,9 @@
     let allKeysSelected = false;
     let activeTab = "keys";
     let metricsGranularity = "minute";
+    let metricsRange = { from: null, to: null };
+    const METRICS_DEFAULT_SPAN = { minute: 60 * 60 * 1000, hour: 24 * 60 * 60 * 1000, day: 7 * 24 * 60 * 60 * 1000 };
+    const METRICS_MAX_SPAN = 7 * 24 * 60 * 60 * 1000;
     let metricItems = [];
     let chartHitPoints = [];
     let chartGeometry = null;
@@ -1061,6 +1080,7 @@
     function showApp() {
       el("loginView").classList.add("hidden");
       el("appView").classList.remove("hidden");
+      updateRangeBox();
       window.clearInterval(refreshTimer);
       refreshTimer = window.setInterval(() => {
         if (el("appView").classList.contains("hidden")) return;
@@ -1148,16 +1168,75 @@
 
     function changeMetricsGranularity(granularity) {
       metricsGranularity = granularity;
+      metricsRange = { from: null, to: null };
       ["minute", "hour", "day"].forEach(name => {
         const button = el(`granularity${name[0].toUpperCase()}${name.slice(1)}`);
         if (button) button.classList.toggle("active", name === metricsGranularity);
       });
+      updateRangeBox();
+      loadMetrics(false);
+    }
+
+    function updateRangeBox() {
+      const box = el("metricsRangeBox");
+      if (!box) return;
+      const show = metricsGranularity === "minute" || metricsGranularity === "hour";
+      box.classList.toggle("hidden", !show);
+      if (show) {
+        const { from, to } = effectiveRange();
+        el("metricsFrom").value = toLocalDatetime(from);
+        el("metricsTo").value = toLocalDatetime(to);
+      }
+    }
+
+    function effectiveRange() {
+      const to = metricsRange.to ? new Date(metricsRange.to) : new Date();
+      const span = METRICS_DEFAULT_SPAN[metricsGranularity] || METRICS_DEFAULT_SPAN.minute;
+      const from = metricsRange.from ? new Date(metricsRange.from) : new Date(to.getTime() - span);
+      return { from, to };
+    }
+
+    function toLocalDatetime(date) {
+      const pad = n => String(n).padStart(2, "0");
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    function applyMetricsRange() {
+      const fromRaw = el("metricsFrom").value;
+      const toRaw = el("metricsTo").value;
+      if (!fromRaw || !toRaw) {
+        toast("请填写起止时间", "error");
+        return;
+      }
+      const from = new Date(fromRaw);
+      const to = new Date(toRaw);
+      if (!(from < to)) {
+        toast("开始时间必须早于结束时间", "error");
+        return;
+      }
+      if (to.getTime() - from.getTime() > METRICS_MAX_SPAN) {
+        toast("时间范围最大 7 天", "error");
+        return;
+      }
+      metricsRange = { from: from.toISOString(), to: to.toISOString() };
+      loadMetrics(false);
+    }
+
+    function resetMetricsRange() {
+      metricsRange = { from: null, to: null };
+      updateRangeBox();
       loadMetrics(false);
     }
 
     async function loadMetrics(showToast = false) {
       try {
-        const data = await api(`/api/admin/metrics?granularity=${encodeURIComponent(metricsGranularity)}`);
+        const { from, to } = effectiveRange();
+        const params = new URLSearchParams({
+          granularity: metricsGranularity,
+          from: from.toISOString(),
+          to: to.toISOString(),
+        });
+        const data = await api(`/api/admin/metrics?${params.toString()}`);
         metricItems = data.items || [];
         el("monitorUpdatedAt").textContent = `最近刷新：${formatDateTime(new Date().toISOString())}`;
         renderMetricsChart();
@@ -1883,7 +1962,7 @@
 
       const dpr = window.devicePixelRatio || 1;
       const width = Math.max(640, Math.floor(canvas.clientWidth || 640));
-      const height = Math.max(420, Math.floor(canvas.clientHeight || 440));
+      const height = Math.max(620, Math.floor(canvas.clientHeight || 640));
       canvas.width = Math.floor(width * dpr);
       canvas.height = Math.floor(height * dpr);
       const ctx = canvas.getContext("2d");
@@ -1956,12 +2035,15 @@
 
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = lane.color;
-        ctx.fillText(lane.label, pad.left - 10, lane.top + lane.height / 2);
         ctx.fillStyle = "#667085";
-        ctx.fillText(formatLaneValue(lane.scaleMax, lane.unit), pad.left - 10, lane.top + 10);
-        ctx.fillText(formatLaneValue(lane.scaleMax / 2, lane.unit), pad.left - 10, lane.top + lane.height / 2 + 0.5);
-        ctx.fillText("0", pad.left - 10, lane.top + lane.height - 8);
+        ctx.fillText(formatLaneValue(lane.scaleMax, lane.unit), pad.left - 10, lane.top + 6);
+        ctx.fillText(formatLaneValue(lane.scaleMax / 2, lane.unit), pad.left - 10, lane.top + lane.height / 2);
+        ctx.fillText("0", pad.left - 10, lane.top + lane.height - 6);
+
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = lane.color;
+        ctx.fillText(lane.label, pad.left + 8, lane.top + 6);
       });
 
       if (points.length === 0) return;
