@@ -802,6 +802,7 @@
           <div class="chart-legend">
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#2563eb"></i>首字响应 ms</span>
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#0f766e"></i>并发数</span>
+            <span class="legend-item"><i class="legend-swatch" style="--legend-color:#64748b"></i>请求数（并发同泳道，右轴）</span>
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#a855f7"></i>排队数</span>
             <span class="legend-item"><i class="legend-swatch" style="--legend-color:#b42318"></i>错误数</span>
             <span class="muted">分泳道展示，Y 轴基于 p95 截断，超出值在线上方以红色三角标注</span>
@@ -1969,15 +1970,17 @@
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      const pad = { top: 18, right: 18, bottom: 40, left: 76 };
-      const plotWidth = width - pad.left - pad.right;
-      const plotHeight = height - pad.top - pad.bottom;
       const series = [
         { key: "firstByteMs", label: "首字响应", unit: "ms", color: "#2563eb", empty: true },
-        { key: "concurrency", label: "并发数", unit: "", color: "#0f766e" },
+        { key: "concurrency", label: "并发数", unit: "", color: "#0f766e",
+          overlay: { key: "requests", label: "请求数", color: "#64748b", dash: [4, 4] } },
         { key: "queueDepth", label: "排队数", unit: "", color: "#a855f7" },
         { key: "errors", label: "错误数", unit: "", color: "#b42318" }
       ];
+      const hasOverlay = series.some(s => s.overlay);
+      const pad = { top: 18, right: hasOverlay ? 76 : 18, bottom: 40, left: 76 };
+      const plotWidth = width - pad.left - pad.right;
+      const plotHeight = height - pad.top - pad.bottom;
       const lanes = buildChartLanes(series, pad, plotHeight, points);
 
       drawChartGrid(ctx, width, height, pad, plotWidth, lanes, points);
@@ -2007,12 +2010,17 @@
       const laneHeight = (plotHeight - gap * (series.length - 1)) / series.length;
       return series.map((item, index) => {
         const values = points.map(point => Number(point[item.key]));
-        return {
+        const lane = {
           ...item,
           top: pad.top + index * (laneHeight + gap),
           height: laneHeight,
           scaleMax: computeLaneScale(values)
         };
+        if (item.overlay) {
+          const overlayValues = points.map(point => Number(point[item.overlay.key]));
+          lane.overlayScaleMax = computeLaneScale(overlayValues);
+        }
+        return lane;
       });
     }
 
@@ -2040,10 +2048,20 @@
         ctx.fillText(formatLaneValue(lane.scaleMax / 2, lane.unit), pad.left - 10, lane.top + lane.height / 2);
         ctx.fillText("0", pad.left - 10, lane.top + lane.height - 6);
 
+        if (lane.overlay && Number.isFinite(lane.overlayScaleMax)) {
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = lane.overlay.color;
+          ctx.fillText(formatLaneValue(lane.overlayScaleMax, ""), width - pad.right + 10, lane.top + 6);
+          ctx.fillText(formatLaneValue(lane.overlayScaleMax / 2, ""), width - pad.right + 10, lane.top + lane.height / 2);
+          ctx.fillText("0", width - pad.right + 10, lane.top + lane.height - 6);
+        }
+
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
         ctx.fillStyle = lane.color;
-        ctx.fillText(lane.label, pad.left + 8, lane.top + 6);
+        const laneTitle = lane.overlay ? `${lane.label}  ·  ${lane.overlay.label}` : lane.label;
+        ctx.fillText(laneTitle, pad.left + 8, lane.top + 6);
       });
 
       if (points.length === 0) return;
@@ -2104,6 +2122,62 @@
         ctx.closePath();
         ctx.fill();
       });
+
+      if (lane.overlay && Number.isFinite(lane.overlayScaleMax) && lane.overlayScaleMax > 0) {
+        drawOverlaySeries(ctx, points, lane, pad, plotWidth);
+      }
+    }
+
+    function drawOverlaySeries(ctx, points, lane, pad, plotWidth) {
+      const overlay = lane.overlay;
+      ctx.save();
+      ctx.setLineDash(overlay.dash || [4, 4]);
+      ctx.strokeStyle = overlay.color;
+      ctx.lineWidth = 1.8;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      let started = false;
+      const dots = [];
+      const outliers = [];
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const numeric = Number(point[overlay.key]);
+        if (!Number.isFinite(numeric)) {
+          started = false;
+          return;
+        }
+        const x = pointX(pad, plotWidth, points.length, index);
+        const exceeded = numeric > lane.overlayScaleMax;
+        const clamped = Math.min(numeric, lane.overlayScaleMax);
+        const y = lane.top + lane.height - (clamped / lane.overlayScaleMax * lane.height);
+        dots.push({ x, y });
+        if (exceeded) outliers.push({ x });
+        addChartHitPoint(point, index, x, { laneKey: overlay.key, color: overlay.color, x, y, value: numeric, exceeded });
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      dots.forEach(dot => {
+        ctx.beginPath();
+        ctx.fillStyle = overlay.color;
+        ctx.arc(dot.x, dot.y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      outliers.forEach(o => {
+        ctx.fillStyle = "#dc2626";
+        ctx.beginPath();
+        ctx.moveTo(o.x, lane.top + 9);
+        ctx.lineTo(o.x - 4, lane.top + 17);
+        ctx.lineTo(o.x + 4, lane.top + 17);
+        ctx.closePath();
+        ctx.fill();
+      });
+      ctx.restore();
     }
 
     function pointX(pad, plotWidth, total, index) {
