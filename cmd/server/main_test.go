@@ -9,6 +9,33 @@ import (
 	"api-fucker/internal/store"
 )
 
+func TestAPIMuxRoutesImageGenerations(t *testing.T) {
+	called := false
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if r.URL.Path != "/v1/images/generations" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	res := httptest.NewRecorder()
+	newAPIMux(handler).ServeHTTP(res, req)
+
+	if !called || res.Code != http.StatusNoContent {
+		t.Fatalf("image route was not dispatched: called=%v status=%d", called, res.Code)
+	}
+
+	called = false
+	req = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
+	res = httptest.NewRecorder()
+	newAPIMux(handler).ServeHTTP(res, req)
+	if called || res.Code != http.StatusNotFound {
+		t.Fatalf("unregistered image route was exposed: called=%v status=%d", called, res.Code)
+	}
+}
+
 func TestIPAllowedMatchesExactAndWildcard(t *testing.T) {
 	if !ipAllowed("127.0.0.1", []string{"127.0.0.1"}, nil) {
 		t.Fatal("exact allowlist should allow")

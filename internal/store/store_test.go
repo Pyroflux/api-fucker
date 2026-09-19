@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestCreateRestoreAndCapture(t *testing.T) {
@@ -79,6 +81,173 @@ func TestCreateRestoreAndCapture(t *testing.T) {
 	}
 	if len(cfg.IPAllowlist) != 3 || cfg.IPAllowlist[1] != "192.*" || len(cfg.IPBlocklist) != 2 || cfg.IPBlocklist[1] != "172.*" {
 		t.Fatalf("unexpected normalized ip rules: %+v", cfg)
+	}
+}
+
+func TestGlobalConfigDefaultsAutoPauseForNewAndLegacyData(t *testing.T) {
+	path := t.TempDir() + "/data.db"
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := st.GlobalConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.KeyAutoPauseEnabled || cfg.KeyAutoPauseThreshold != defaultKeyAutoPauseThreshold {
+		t.Fatalf("unexpected new config auto-pause defaults: %+v", cfg)
+	}
+
+	err = st.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(metaBucket)).Put([]byte(globalConfigID), []byte(`{"upstreamBaseUrl":"https://legacy.example"}`))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg, err = st.GlobalConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.KeyAutoPauseEnabled || cfg.KeyAutoPauseThreshold != defaultKeyAutoPauseThreshold {
+		t.Fatalf("unexpected legacy config auto-pause defaults: %+v", cfg)
+	}
+}
+
+func TestRecordFailureUsesConfiguredAutoPauseThreshold(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   true,
+		KeyAutoPauseThreshold: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, err = st.RecordFailure(key.ID, "first failure", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.Paused || key.ConsecutiveErrors != 1 {
+		t.Fatalf("key paused before threshold: %+v", key)
+	}
+	key, err = st.RecordFailure(key.ID, "second failure", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !key.Paused || key.ConsecutiveErrors != 2 {
+		t.Fatalf("key not paused at threshold: %+v", key)
+	}
+
+	if err := st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   false,
+		KeyAutoPauseThreshold: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err = st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !key.Paused {
+		t.Fatalf("disabling auto-pause should not restore an existing key: %+v", key)
+	}
+}
+
+func TestRecordFailureCanDisableAndReenableAutoPause(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   false,
+		KeyAutoPauseThreshold: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		key, err = st.RecordFailure(key.ID, "upstream failure", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if key.Paused || key.ConsecutiveErrors != 4 {
+		t.Fatalf("disabled auto-pause should only count failures: %+v", key)
+	}
+
+	if err := st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   true,
+		KeyAutoPauseThreshold: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err = st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.Paused {
+		t.Fatalf("enabling auto-pause should not scan existing keys: %+v", key)
+	}
+	key, err = st.RecordFailure(key.ID, "next failure", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !key.Paused || key.ConsecutiveErrors != 5 {
+		t.Fatalf("next failure should apply the enabled threshold: %+v", key)
+	}
+}
+
+func TestBalanceDepletedPausesWhenAutoPauseDisabled(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   false,
+		KeyAutoPauseThreshold: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.CreateKey(Key{Name: "a", APIKey: "secret-a", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err = st.RecordFailure(key.ID, "quota depleted", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !key.Paused || !key.BalanceDepleted {
+		t.Fatalf("balance-depleted key should pause independently: %+v", key)
 	}
 }
 
@@ -283,6 +452,23 @@ func TestSaveGlobalConfigRejectsNegativeKeyRpm(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "key max requests per minute") {
 		t.Fatalf("expected negative-rpm error, got %v", err)
+	}
+}
+
+func TestSaveGlobalConfigRejectsNegativeAutoPauseThreshold(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	err = st.SaveGlobalConfig(GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   true,
+		KeyAutoPauseThreshold: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "key auto-pause threshold") {
+		t.Fatalf("expected negative auto-pause threshold error, got %v", err)
 	}
 }
 

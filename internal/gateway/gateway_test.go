@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -186,6 +187,300 @@ func TestGatewayForwardsModelsList(t *testing.T) {
 	}
 	if !updated.LastUsedAt.IsZero() || updated.ConsecutiveErrors != 0 || updated.LastFirstByteMS != nil {
 		t.Fatalf("models response should not update key usage state: %+v", updated)
+	}
+}
+
+func TestGatewayForwardsImageGenerations(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	requestBody := `{"model":"image-model","prompt":"a lighthouse","size":"1024x1024","response_format":"b64_json"}`
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if r.URL.String() != "https://upstream.example/v1/images/generations" {
+				t.Fatalf("unexpected upstream url: %s", r.URL.String())
+			}
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				t.Fatalf("missing upstream auth: %s", r.Header.Get("Authorization"))
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != requestBody {
+				t.Fatalf("body = %q, want %q", body, requestBody)
+			}
+			resp := jsonResponse(r, http.StatusOK, map[string]any{
+				"created": 123,
+				"data":    []map[string]string{{"b64_json": "aW1hZ2U="}},
+			})
+			resp.Header.Set("X-Upstream", "image")
+			return resp, nil
+		})}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(requestBody))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Upstream") != "image" || !strings.Contains(rec.Body.String(), `"b64_json":"aW1hZ2U="`) {
+		t.Fatalf("image response was not preserved: headers=%v body=%s", rec.Header(), rec.Body.String())
+	}
+}
+
+func TestGatewayTracksImageGenerationUsage(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if trace := httptrace.ContextClientTrace(r.Context()); trace != nil && trace.GotFirstResponseByte != nil {
+				trace.GotFirstResponseByte()
+			}
+			return jsonResponse(r, http.StatusOK, map[string]any{"data": []map[string]string{{"url": "https://cdn.example/image.png"}}}), nil
+		})}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"a lighthouse"}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	capture, err := st.GetCapture(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capture.RequestURL != "https://upstream.example/v1/images/generations" || !strings.Contains(capture.ResponseBody, "image.png") {
+		t.Fatalf("unexpected capture: %+v", capture)
+	}
+	points, err := st.ListMetrics("minute", time.Time{}, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Requests != 1 || points[0].Errors != 0 {
+		t.Fatalf("unexpected metrics: %+v", points)
+	}
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastUsedAt.IsZero() || updated.ConsecutiveErrors != 0 || updated.LastFirstByteMS == nil {
+		t.Fatalf("image request did not update key usage: %+v", updated)
+	}
+}
+
+func TestGatewayTruncatesStoredImageResponseWithoutTruncatingClientResponse(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encodedImage := strings.Repeat("a", 70*1024)
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return jsonResponse(r, http.StatusOK, map[string]any{
+				"data": []map[string]string{{"b64_json": encodedImage}},
+			}), nil
+		})}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"a lighthouse","response_format":"b64_json"}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), encodedImage) {
+		t.Fatalf("client response was truncated: status=%d bytes=%d", rec.Code, rec.Body.Len())
+	}
+
+	capture, err := st.GetCapture(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const captureLimit = 64 * 1024
+	if !strings.HasPrefix(capture.ResponseBody, rec.Body.String()[:captureLimit]) {
+		t.Fatalf("capture does not preserve the first %d response bytes", captureLimit)
+	}
+	marker := fmt.Sprintf("...[truncated: original response body %d bytes]", rec.Body.Len())
+	if !strings.HasSuffix(capture.ResponseBody, marker) {
+		t.Fatalf("capture is missing truncation marker %q: bytes=%d", marker, len(capture.ResponseBody))
+	}
+	if len(capture.ResponseBody) >= rec.Body.Len() {
+		t.Fatalf("capture bytes = %d, client bytes = %d", len(capture.ResponseBody), rec.Body.Len())
+	}
+}
+
+func TestGatewayRejectsWrongMethodForImageGenerations(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/generations", nil)
+	rec := httptest.NewRecorder()
+	New(st, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestGatewayRecordsImageGenerationFailureWithoutRetryingHTTPStatus(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return jsonResponse(r, http.StatusInternalServerError, map[string]string{"error": "generation failed"}), nil
+		})}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"a lighthouse"}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || calls != 1 {
+		t.Fatalf("status=%d calls=%d, want status=500 calls=1", rec.Code, calls)
+	}
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ConsecutiveErrors != 1 || !strings.Contains(updated.LastError, "generation failed") {
+		t.Fatalf("unexpected key failure state: %+v", updated)
+	}
+	points, err := st.ListMetrics("minute", time.Time{}, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Requests != 1 || points[0].Errors != 1 {
+		t.Fatalf("unexpected metrics: %+v", points)
+	}
+}
+
+func TestGatewayRetriesImageGenerationTransportError(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", BaseURL: "https://upstream.example", MaxConcurrency: 1}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return jsonResponse(r, http.StatusOK, map[string]any{"data": []any{}}), nil
+		})}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"a lighthouse"}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("status=%d calls=%d, want status=200 calls=2", rec.Code, calls)
+	}
+}
+
+func TestGatewayAppliesGlobalConcurrencyLimitToImageGenerations(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:      "https://upstream.example",
+		GlobalMaxConcurrency: 1,
+		MaxQueueSize:         0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", MaxConcurrency: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return jsonResponse(r, http.StatusOK, map[string]any{"data": []any{}}), nil
+		})}, nil
+	}
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"first"}`))
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		firstDone <- rec
+	}()
+	<-started
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"image-model","prompt":"second"}`))
+	secondRec := httptest.NewRecorder()
+	gw.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429", secondRec.Code)
+	}
+
+	close(release)
+	firstRec := <-firstDone
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", firstRec.Code)
 	}
 }
 
@@ -674,6 +969,61 @@ func TestGatewayDoesNotRetryUpstream5xxStatus(t *testing.T) {
 	}
 }
 
+func TestGatewayPausesKeyAtConfiguredFailureThreshold(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SaveGlobalConfig(store.GlobalConfig{
+		UpstreamBaseURL:       "https://upstream.example",
+		KeyAutoPauseEnabled:   true,
+		KeyAutoPauseThreshold: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := st.CreateKey(store.Key{Name: "k1", APIKey: "secret", MaxConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	gw := New(st, nil)
+	gw.newClient = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return jsonResponse(r, http.StatusInternalServerError, nil), nil
+		})}, nil
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("request %d status = %d, want %d", i+1, rec.Code, http.StatusInternalServerError)
+		}
+	}
+	updated, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Paused || updated.ConsecutiveErrors != 2 {
+		t.Fatalf("key was not paused at configured threshold: %+v", updated)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`))
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request after pause status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
 func TestGatewayPerKeyRateLimitReturns429(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/data.db")
 	if err != nil {
@@ -995,5 +1345,71 @@ func jsonResponse(req *http.Request, status int, value any) *http.Response {
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(&body),
 		Request:    req,
+	}
+}
+
+func TestCancellationPreservesRealError(t *testing.T) {
+	for _, mode := range []string{"gateway", "test"} {
+		t.Run(mode, func(t *testing.T) {
+			st, err := store.Open(t.TempDir() + "/data.db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			key, err := st.CreateKey(store.Key{Name: "test", APIKey: "test-placeholder", BaseURL: "https://upstream.example"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.RecordFailure(key.ID, "real upstream failure", false); err != nil {
+				t.Fatal(err)
+			}
+			gw := New(st, nil)
+			gw.newClient = func(string) (*http.Client, error) {
+				return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, context.Canceled })}, nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if mode == "gateway" {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[]}`)).WithContext(ctx)
+				gw.ServeHTTP(httptest.NewRecorder(), req)
+			} else {
+				cfg, err := st.GlobalConfig()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = gw.TestKey(ctx, key, cfg, "x", "hello")
+			}
+			updated, err := st.GetKey(key.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.ConsecutiveErrors != 1 || updated.LastError != "real upstream failure" || updated.Paused {
+				t.Fatalf("cancellation changed error state: %+v", updated)
+			}
+			capture, err := st.GetCapture(key.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if capture.Error != "" {
+				t.Fatalf("cancellation recorded as error: %s", capture.Error)
+			}
+			for _, event := range capture.NetworkEvents {
+				if strings.Contains(event.Error, "context canceled") {
+					t.Fatal("cancellation persisted in timeline")
+				}
+			}
+			if got := capture.RequestHeader["Authorization"]; len(got) != 1 || got[0] != "Bearer test-placeholder" {
+				t.Fatal("missing actual upstream credential")
+			}
+			points, err := st.ListMetrics("minute", time.Time{}, time.Now().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, point := range points {
+				if point.Errors != 0 {
+					t.Fatal("cancellation counted as metric error")
+				}
+			}
+		})
 	}
 }

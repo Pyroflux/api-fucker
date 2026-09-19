@@ -23,7 +23,9 @@ import (
 
 const (
 	chatPath                  = "/v1/chat/completions"
+	imageGenerationsPath      = "/v1/images/generations"
 	modelsPath                = "/v1/models"
+	imageCaptureResponseLimit = 64 * 1024
 	upstreamMaxAttempts       = 3
 	upstreamRetryBaseDelay    = 300 * time.Millisecond
 	upstreamDialTimeout       = 30 * time.Second
@@ -162,7 +164,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	isStream := upstreamPath == chatPath && requestWantsStream(body)
-	if upstreamPath == chatPath {
+	isManagedGeneration := isManagedGenerationPath(upstreamPath)
+	if isManagedGeneration {
 		cfg, _ := g.store.GlobalConfig()
 		releaseGlobal, err := g.acquireGlobalSlot(r.Context(), cfg)
 		if err != nil {
@@ -207,21 +210,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture.DurationMS = time.Since(start).Milliseconds()
 	capture.StatusCode = status
 	capture.ResponseHeader = redactHeader(respHeader)
-	capture.ResponseBody = string(respBody)
-	if forwardErr != nil {
+	capture.ResponseBody = captureResponseBody(upstreamPath, respBody)
+	if forwardErr != nil && !errors.Is(forwardErr, context.Canceled) {
 		capture.Error = forwardErr.Error()
 	}
+	capture.RequestHeader["Authorization"] = []string{"Bearer " + selected.key.APIKey}
 	capture.NetworkEvents = progress.events()
-	if upstreamPath == chatPath {
+	if isManagedGeneration {
 		_ = g.store.SaveCapture(capture)
 		_ = g.store.RecordMetric(selected.key.ID, store.MetricSample{
 			Time:        capture.Time,
 			FirstByteMS: firstByteElapsedMS(capture.NetworkEvents),
 			Concurrency: g.totalConcurrency(),
 			QueueDepth:  g.consumeQueuePeak(),
-			Error:       forwardErr != nil || status >= 400,
+			Error:       !errors.Is(forwardErr, context.Canceled) && (forwardErr != nil || status >= 400),
 		})
 
+		if errors.Is(forwardErr, context.Canceled) {
+			return
+		}
 		if forwardErr != nil {
 			_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false, capture.DurationMS)
 			return
@@ -394,11 +401,24 @@ func routeRequest(r *http.Request) (string, string, error) {
 	switch r.URL.Path {
 	case chatPath:
 		return chatPath, http.MethodPost, nil
+	case imageGenerationsPath:
+		return imageGenerationsPath, http.MethodPost, nil
 	case modelsPath:
 		return modelsPath, http.MethodGet, nil
 	default:
 		return "", "", fmt.Errorf("not found")
 	}
+}
+
+func isManagedGenerationPath(path string) bool {
+	return path == chatPath || path == imageGenerationsPath
+}
+
+func captureResponseBody(path string, body []byte) string {
+	if path != imageGenerationsPath || len(body) <= imageCaptureResponseLimit {
+		return string(body)
+	}
+	return string(body[:imageCaptureResponseLimit]) + fmt.Sprintf("\n...[truncated: original response body %d bytes]", len(body))
 }
 
 func (g *Gateway) CurrentConcurrency() map[string]int {
@@ -703,15 +723,18 @@ func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg st
 	capture.StatusCode = status
 	capture.ResponseHeader = redactHeader(header)
 	capture.ResponseBody = string(respBody)
-	if forwardErr != nil {
+	if forwardErr != nil && !errors.Is(forwardErr, context.Canceled) {
 		capture.Error = forwardErr.Error()
 		captureProgress.emit(TestProgressEvent{Step: "upstream_error", Message: "上游请求失败", DurationMS: capture.DurationMS, Error: forwardErr.Error()})
 	}
+	capture.RequestHeader = map[string][]string{"Authorization": {"Bearer " + key.APIKey}}
 	capture.NetworkEvents = captureProgress.events()
 	if g.store != nil {
 		emitProgress(progress, TestProgressEvent{Step: "record", Message: "写入测试结果和 Key 状态"})
 		_ = g.store.SaveCapture(capture)
-		if forwardErr != nil {
+		if errors.Is(forwardErr, context.Canceled) {
+			// Cancellation must not change the key's failure or success state.
+		} else if forwardErr != nil {
 			_, _ = g.store.RecordFailure(key.ID, forwardErr.Error(), false, capture.DurationMS)
 		} else if status >= 400 {
 			_, _ = g.store.RecordFailure(key.ID, truncate(string(respBody), 1000), looksBalanceDepleted(status, respBody), capture.DurationMS)
@@ -822,7 +845,7 @@ func newCaptureProgressRecorder(external func(TestProgressEvent)) *captureProgre
 func (r *captureProgressRecorder) emit(event TestProgressEvent) {
 	event.ElapsedMS = time.Since(r.start).Milliseconds()
 	emitProgress(r.external, event)
-	if !shouldCaptureNetworkEvent(event) {
+	if !shouldCaptureNetworkEvent(event) || strings.Contains(event.Error, context.Canceled.Error()) {
 		return
 	}
 	r.items = append(r.items, store.CaptureNetworkEvent{

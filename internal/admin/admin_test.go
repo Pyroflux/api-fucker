@@ -51,6 +51,22 @@ func TestLoginCookieAuthorizesSpecialToken(t *testing.T) {
 	}
 }
 
+func TestAdminPageIncludesAutoPauseControls(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("admin page status = %d, want %d", res.Code, http.StatusOK)
+	}
+	body := res.Body.String()
+	if !strings.Contains(body, `id="keyAutoPauseEnabled"`) || !strings.Contains(body, `id="keyAutoPauseThreshold"`) {
+		t.Fatalf("admin page is missing auto-pause controls")
+	}
+}
+
 func TestKeysFilterAndSort(t *testing.T) {
 	h, closeStore := newTestHandler(t, "token")
 	defer closeStore()
@@ -106,6 +122,8 @@ func TestConfigSavesIPRules(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/admin/config", strings.NewReader(`{
 		"upstreamBaseUrl":"https://upstream.example",
 		"defaultProxyUrl":"",
+		"keyAutoPauseEnabled":false,
+		"keyAutoPauseThreshold":5,
 		"ipAllowlist":["127.0.0.1","192.*"],
 		"ipBlocklist":["10.*"]
 	}`))
@@ -127,6 +145,9 @@ func TestConfigSavesIPRules(t *testing.T) {
 	}
 	if len(cfg.IPAllowlist) != 2 || cfg.IPAllowlist[1] != "192.*" || len(cfg.IPBlocklist) != 1 || cfg.IPBlocklist[0] != "10.*" {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	if cfg.KeyAutoPauseEnabled || cfg.KeyAutoPauseThreshold != 5 {
+		t.Fatalf("unexpected auto-pause config: %+v", cfg)
 	}
 }
 
@@ -404,4 +425,51 @@ func (f *fakeUpstream) TestKey(_ context.Context, _ store.Key, _ store.GlobalCon
 func (f *fakeUpstream) TestKeyWithProgress(ctx context.Context, key store.Key, cfg store.GlobalConfig, model string, prompt string, progress func(gateway.TestProgressEvent)) (gateway.UpstreamTestResult, error) {
 	progress(gateway.TestProgressEvent{Step: "fake", Message: "fake progress"})
 	return f.TestKey(ctx, key, cfg, model, prompt)
+}
+
+func TestResponseCodeFilterAndCaptureCredentials(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+	for _, code := range []int{0, 200, 429, 503} {
+		key, err := h.store.CreateKey(store.Key{APIKey: "test-placeholder", Name: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code != 0 {
+			if err := h.store.SaveCapture(store.Capture{KeyID: key.ID, StatusCode: code, RequestHeader: map[string][]string{"Authorization": {"Bearer historical-placeholder"}}}); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/admin/keys/"+key.ID+"/capture", nil)
+			res := httptest.NewRecorder()
+			h.ServeHTTP(res, req)
+			if res.Code != http.StatusUnauthorized {
+				t.Fatal("capture must require authentication")
+			}
+			req.Header.Set("Authorization", "Bearer token")
+			res = httptest.NewRecorder()
+			h.ServeHTTP(res, req)
+			if res.Code != 200 || res.Header().Get("Cache-Control") != "no-store" || !strings.Contains(res.Body.String(), "historical-placeholder") || !strings.Contains(res.Body.String(), `"currentApiKey":"test-placeholder"`) {
+				t.Fatalf("unexpected capture response: %s", res.Body.String())
+			}
+		}
+	}
+	for _, tc := range []struct {
+		filter string
+		total  int
+	}{{"all", 4}, {"none", 1}, {"200", 1}, {"4xx", 1}, {"5xx", 1}, {"404", 0}, {"invalid", 0}} {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/keys?responseCode="+tc.filter+"&pageSize=1", nil)
+		req.Header.Set("Authorization", "Bearer token")
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, req)
+		var result keyListResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Total != tc.total {
+			t.Fatalf("filter %s: total %d, want %d", tc.filter, result.Total, tc.total)
+		}
+		if tc.filter == "200" && result.Items[0].LastStatusCode != 200 {
+			t.Fatal("missing last response code")
+		}
+	}
 }

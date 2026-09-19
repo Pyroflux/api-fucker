@@ -78,6 +78,21 @@
       font-weight: 600;
       min-width: 0;
     }
+    .checkbox-control {
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 2px;
+      color: var(--text);
+    }
+    .checkbox-control input[type="checkbox"] {
+      width: 18px;
+      min-height: 18px;
+      margin: 0;
+      padding: 0;
+      accent-color: var(--primary);
+    }
     .hidden { display: none !important; }
 
     .login-screen {
@@ -676,6 +691,14 @@
                 <option value="error">有错误</option>
               </select>
             </label>
+            <label>响应码
+              <input id="responseCodeFilter" list="responseCodeOptions" placeholder="全部 / 输入响应码" onchange="changeResponseCodeFilter()" style="width:150px">
+              <datalist id="responseCodeOptions">
+                <option value="all">全部</option><option value="none">无响应码</option>
+                <option value="2xx"></option><option value="3xx"></option><option value="4xx"></option><option value="5xx"></option>
+                <option value="200"></option><option value="401"></option><option value="403"></option><option value="429"></option><option value="500"></option><option value="502"></option><option value="503"></option>
+              </datalist>
+            </label>
             <label>排序
               <select id="sortMode" onchange="changeSortMode()">
                 <option value="default">默认排序</option>
@@ -725,6 +748,7 @@
                 <th>首字响应</th>
                 <th>总响应</th>
                 <th>错误</th>
+                <th>响应码</th>
                 <th>最后使用</th>
                 <th style="text-align:right">操作</th>
               </tr>
@@ -856,6 +880,12 @@
           </label>
           <label>单 Key 每分钟上限
             <input id="keyMaxRequestsPerMinute" type="number" min="0" step="1" placeholder="0 表示不限制">
+          </label>
+          <label>连续失败自动暂停
+            <span class="checkbox-control"><input id="keyAutoPauseEnabled" type="checkbox" onchange="syncKeyAutoPauseControl()">启用</span>
+          </label>
+          <label>连续失败暂停次数
+            <input id="keyAutoPauseThreshold" type="number" min="1" step="1" value="3">
           </label>
           <label>慢启动间隔 ms
             <input id="launchIntervalMs" type="number" min="0" step="50" placeholder="0 表示不延迟">
@@ -1026,6 +1056,7 @@
     let stats = { total: 0, healthy: 0, paused: 0, inflight: 0 };
     let refreshTimer = 0;
     let statusFilter = "all";
+    let responseCodeFilter = "all";
     let sortBy = "default";
     let sortOrder = "desc";
     let testingId = "";
@@ -1123,6 +1154,7 @@
           page: String(page),
           pageSize: String(pageSize),
           status: statusFilter,
+          responseCode: responseCodeFilter,
           sort: sortBy,
           order: sortOrder
         });
@@ -1255,6 +1287,10 @@
       configDialog.showModal();
     }
 
+    function syncKeyAutoPauseControl() {
+      el("keyAutoPauseThreshold").disabled = !el("keyAutoPauseEnabled").checked;
+    }
+
     function fillConfigForm(cfg) {
       setValue("upstreamBaseUrl", cfg.upstreamBaseUrl || "");
       setValue("defaultProxyUrl", cfg.defaultProxyUrl || "");
@@ -1264,12 +1300,20 @@
       setValue("maxQueueSize", String(cfg.maxQueueSize || 0));
       setValue("queueTimeoutMs", String(cfg.queueTimeoutMs || 0));
       setValue("keyMaxRequestsPerMinute", String(cfg.keyMaxRequestsPerMinute || 0));
+      el("keyAutoPauseEnabled").checked = cfg.keyAutoPauseEnabled !== false;
+      setValue("keyAutoPauseThreshold", String(cfg.keyAutoPauseThreshold || 3));
+      syncKeyAutoPauseControl();
       setValue("launchIntervalMs", String(cfg.launchIntervalMs || 0));
       setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
       setValue("ipBlocklist", joinRules(cfg.ipBlocklist || []));
     }
 
     async function saveConfig() {
+      const keyAutoPauseThreshold = Number(value("keyAutoPauseThreshold") || "0");
+      if (!Number.isInteger(keyAutoPauseThreshold) || keyAutoPauseThreshold <= 0) {
+        toast("连续失败暂停次数必须是大于 0 的整数", "error");
+        return;
+      }
       const button = el("saveConfigButton");
       button.disabled = true;
       try {
@@ -1284,6 +1328,8 @@
             maxQueueSize: Number(value("maxQueueSize") || "0"),
             queueTimeoutMs: Number(value("queueTimeoutMs") || "0"),
             keyMaxRequestsPerMinute: Number(value("keyMaxRequestsPerMinute") || "0"),
+            keyAutoPauseEnabled: el("keyAutoPauseEnabled").checked,
+            keyAutoPauseThreshold,
             launchIntervalMs: Number(value("launchIntervalMs") || "0"),
             ipAllowlist: splitRules(value("ipAllowlist")),
             ipBlocklist: splitRules(value("ipBlocklist"))
@@ -1416,6 +1462,18 @@
     function changePageSize() {
       pageSize = Number(value("pageSize") || "100");
       if (pageSize > 1000) pageSize = 1000;
+      page = 1;
+      allKeysSelected = false;
+      loadAll(false);
+    }
+
+    function changeResponseCodeFilter() {
+      const filter = value("responseCodeFilter").trim().toLowerCase() || "all";
+      if (!/^(all|none|[1-5]xx|[1-5][0-9]{2})$/.test(filter)) {
+        alert("请输入 100–599 响应码、2xx 等分组，或 all / none");
+        return;
+      }
+      responseCodeFilter = filter;
       page = 1;
       allKeysSelected = false;
       loadAll(false);
@@ -1789,6 +1847,8 @@
           ${captureField("响应状态", String(data.statusCode || "-"))}
           ${captureField("耗时", data.durationMs != null ? formatDuration(data.durationMs) : "-")}
         </div>
+        ${captureSection("当前 Key", data.currentApiKey || "-")}
+        <p class="muted">请求头显示该次请求使用的 Key；旧记录中的 [redacted] 无法还原，可参考上方当前 Key。</p>
         ${captureSection("请求头", formatJSON(data.requestHeader || {}))}
         ${captureSection("请求数据", formatPayload(data.requestBody))}
         ${captureNetworkSection(data.networkEvents || [])}
@@ -1872,6 +1932,7 @@
           <td>${formatDuration(k.lastFirstByteMs)}</td>
           <td>${formatDuration(k.lastResponseMs)}</td>
           <td><span>${k.consecutiveErrors || 0}</span>${k.lastError ? `<div class="muted truncate">${escapeHtml(k.lastError)}</div>` : ""}</td>
+          <td>${k.lastStatusCode || "—"}</td>
           <td>${formatDateTime(k.lastUsedAt)}</td>
           <td>
             <div class="row-actions">

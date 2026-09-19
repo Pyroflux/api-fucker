@@ -1,10 +1,11 @@
 # api-fucker
 
-`api-fucker` is a lightweight OpenAI-compatible gateway for NVIDIA Integrate API forwarding. It exposes `/v1/chat/completions` and `/v1/models`, manages an upstream API key pool, supports per-key proxy routing, and includes an embedded admin console for operations, diagnostics, and traffic control.
+`api-fucker` is a lightweight OpenAI-compatible gateway for NVIDIA Integrate API forwarding. It exposes `/v1/chat/completions`, `/v1/images/generations`, and `/v1/models`, manages an upstream API key pool, supports per-key proxy routing, and includes an embedded admin console for operations, diagnostics, and traffic control.
 
 ## Features
 
 - OpenAI-compatible forwarding for chat completions and model listing.
+- OpenAI-compatible image generation forwarding with URL and Base64 JSON responses.
 - Key pool management with enable/disable, pause/restore, balance/error tracking, and per-key concurrency limits.
 - Global and per-key upstream base URL / proxy configuration.
 - HTTP proxy support with conservative HTTP/1.1 upstream transport for unstable residential proxies.
@@ -92,6 +93,7 @@ docker buildx build --platform linux/amd64 -t pyroflux/api-fucker:latest .
 | Default proxy URL | Optional HTTP proxy used when a key does not override it. Supports proxy auth in the URL. |
 | VPS proxy pool | When enabled, all API traffic uses online enabled VPS proxy nodes instead of key/global proxy settings. |
 | Proxy mode | `round_robin` rotates online proxy nodes; `key_binding` keeps each upstream API key on a stable node when possible. |
+| Key auto-pause | Enabled by default with a threshold of 3 consecutive failures. It can be disabled or configured with a positive failure threshold. Balance-depleted keys are still paused immediately. |
 | Request IP allowlist | Optional list of IP patterns allowed to access `/v1/*`. Empty means allow all unless blocked. |
 | Request IP blocklist | Optional list of IP patterns denied from accessing `/v1/*`. Blocklist wins over allowlist. |
 
@@ -135,6 +137,27 @@ The gateway forwards to:
 {upstreamBaseUrl}/v1/models
 ```
 
+### Image Generations
+
+```bash
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"your-image-model",
+    "prompt":"a lighthouse on a rocky coast at sunrise",
+    "size":"1024x1024",
+    "response_format":"b64_json"
+  }'
+```
+
+The gateway forwards the request body unchanged to:
+
+```text
+{upstreamBaseUrl}/v1/images/generations
+```
+
+Image generation shares the chat endpoint's key pool, proxy routing, concurrency controls, retries, key health tracking, and request metrics. The upstream status, headers, and response body are returned unchanged.
+
 ## Key Management
 
 Keys can be added manually or imported in bulk from the admin console. Bulk import accepts one key per line:
@@ -162,6 +185,8 @@ The admin console records the latest request details for each key:
 - Response status, headers, and body.
 - Upstream or transport error text.
 - Network timeline with millisecond offsets.
+
+Image responses are returned to clients in full. To prevent Base64 image data from rapidly growing the database, the response body stored in the latest capture is limited to 64 KiB and includes the original byte count when truncated.
 
 Timeline events distinguish direct and proxied requests, including DNS resolution, proxy connection, CONNECT tunnel establishment, upstream TLS handshake, request send, first byte, response read, retry, and failure steps.
 

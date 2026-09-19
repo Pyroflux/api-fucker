@@ -35,10 +35,7 @@ func main() {
 	adminHandler.SetQueueDepth(gw.QueueDepth)
 	adminHandler.SetKeyMinuteUsage(gw.KeyMinuteUsage)
 
-	apiMux := http.NewServeMux()
-	apiMux.Handle("/v1/chat/completions", gw)
-	apiMux.Handle("/v1/models", gw)
-	apiMux.HandleFunc("/healthz", healthz)
+	apiMux := newAPIMux(gw)
 
 	adminMux := http.NewServeMux()
 	adminMux.Handle("/admin", adminHandler)
@@ -60,6 +57,15 @@ func main() {
 	go serve("request api", apiSrv, errCh)
 	go serve("admin", adminSrv, errCh)
 	log.Fatal(<-errCh)
+}
+
+func newAPIMux(gatewayHandler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/v1/chat/completions", gatewayHandler)
+	mux.Handle("/v1/images/generations", gatewayHandler)
+	mux.Handle("/v1/models", gatewayHandler)
+	mux.HandleFunc("/healthz", healthz)
+	return mux
 }
 
 func getenv(key, fallback string) string {

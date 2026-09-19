@@ -27,6 +27,8 @@ const (
 	ProxyModeRoundRobin  = "round_robin"
 	ProxyModeKeyBinding  = "key_binding"
 	ProxyNodeOnlineAfter = 30 * time.Second
+
+	defaultKeyAutoPauseThreshold = 3
 )
 
 var (
@@ -38,17 +40,19 @@ type Store struct {
 }
 
 type GlobalConfig struct {
-	UpstreamBaseURL      string    `json:"upstreamBaseUrl"`
-	DefaultProxyURL      string    `json:"defaultProxyUrl"`
-	IPAllowlist          []string  `json:"ipAllowlist,omitempty"`
-	IPBlocklist          []string  `json:"ipBlocklist,omitempty"`
-	ProxyPoolEnabled     bool      `json:"proxyPoolEnabled"`
-	ProxyMode            string    `json:"proxyMode"`
+	UpstreamBaseURL         string    `json:"upstreamBaseUrl"`
+	DefaultProxyURL         string    `json:"defaultProxyUrl"`
+	IPAllowlist             []string  `json:"ipAllowlist,omitempty"`
+	IPBlocklist             []string  `json:"ipBlocklist,omitempty"`
+	ProxyPoolEnabled        bool      `json:"proxyPoolEnabled"`
+	ProxyMode               string    `json:"proxyMode"`
 	GlobalMaxConcurrency    int       `json:"globalMaxConcurrency"`
 	MaxQueueSize            int       `json:"maxQueueSize"`
 	QueueTimeoutMS          int       `json:"queueTimeoutMs"`
 	KeyMaxRequestsPerMinute int       `json:"keyMaxRequestsPerMinute"`
 	LaunchIntervalMS        int       `json:"launchIntervalMs"`
+	KeyAutoPauseEnabled     bool      `json:"keyAutoPauseEnabled"`
+	KeyAutoPauseThreshold   int       `json:"keyAutoPauseThreshold"`
 	UpdatedAt               time.Time `json:"updatedAt"`
 }
 
@@ -64,6 +68,7 @@ type Key struct {
 	BalanceDepleted   bool      `json:"balanceDepleted"`
 	ConsecutiveErrors int       `json:"consecutiveErrors"`
 	LastError         string    `json:"lastError"`
+	LastStatusCode    int       `json:"lastStatusCode"`
 	LastFirstByteMS   *int64    `json:"lastFirstByteMs,omitempty"`
 	LastResponseMS    *int64    `json:"lastResponseMs,omitempty"`
 	LastUsedAt        time.Time `json:"lastUsedAt"`
@@ -230,7 +235,7 @@ func (s *Store) init() error {
 		}
 		b := tx.Bucket([]byte(metaBucket))
 		if b.Get([]byte(globalConfigID)) == nil {
-			cfg := GlobalConfig{UpdatedAt: time.Now().UTC()}
+			cfg := defaultGlobalConfig()
 			raw, err := json.Marshal(cfg)
 			if err != nil {
 				return err
@@ -250,10 +255,17 @@ func (s *Store) GlobalConfig() (GlobalConfig, error) {
 		}
 		return json.Unmarshal(raw, &cfg)
 	})
+	if err == nil {
+		cfg = normalizeGlobalConfig(cfg)
+	}
 	return cfg, err
 }
 
 func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
+	if cfg.KeyAutoPauseThreshold < 0 {
+		return fmt.Errorf("key auto-pause threshold cannot be negative")
+	}
+	cfg = normalizeGlobalConfig(cfg)
 	if err := validateRequiredURL(cfg.UpstreamBaseURL, "upstream base URL"); err != nil {
 		return err
 	}
@@ -297,6 +309,22 @@ func normalizeProxyMode(mode string) string {
 	}
 }
 
+func defaultGlobalConfig() GlobalConfig {
+	return GlobalConfig{
+		KeyAutoPauseEnabled:   true,
+		KeyAutoPauseThreshold: defaultKeyAutoPauseThreshold,
+		UpdatedAt:             time.Now().UTC(),
+	}
+}
+
+func normalizeGlobalConfig(cfg GlobalConfig) GlobalConfig {
+	if cfg.KeyAutoPauseThreshold == 0 {
+		cfg.KeyAutoPauseEnabled = true
+		cfg.KeyAutoPauseThreshold = defaultKeyAutoPauseThreshold
+	}
+	return cfg
+}
+
 func normalizeRules(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
@@ -319,6 +347,16 @@ func (s *Store) ListKeys() ([]Key, error) {
 			var key Key
 			if err := json.Unmarshal(v, &key); err != nil {
 				return err
+			}
+			// Read only the status field, including captures saved by older versions.
+			if raw := tx.Bucket([]byte(captureBucket)).Get([]byte(key.ID)); raw != nil {
+				var summary struct {
+					StatusCode int `json:"statusCode"`
+				}
+				if err := json.Unmarshal(raw, &summary); err != nil {
+					return err
+				}
+				key.LastStatusCode = summary.StatusCode
 			}
 			keys = append(keys, key)
 			return nil
@@ -618,6 +656,10 @@ func (s *Store) RecordFailure(id, message string, balanceDepleted bool, response
 	if err != nil {
 		return Key{}, err
 	}
+	cfg, err := s.GlobalConfig()
+	if err != nil {
+		return Key{}, err
+	}
 	key.ConsecutiveErrors++
 	key.LastError = message
 	key.LastUsedAt = time.Now().UTC()
@@ -629,7 +671,7 @@ func (s *Store) RecordFailure(id, message string, balanceDepleted bool, response
 		key.BalanceDepleted = true
 		key.Paused = true
 	}
-	if key.ConsecutiveErrors >= 3 {
+	if cfg.KeyAutoPauseEnabled && key.ConsecutiveErrors >= cfg.KeyAutoPauseThreshold {
 		key.Paused = true
 	}
 	return s.saveKey(key)

@@ -610,7 +610,7 @@ func (h *Handler) keys(w http.ResponseWriter, r *http.Request) {
 			}
 			stats.Inflight += current
 			view := store.KeyView{Key: key, CurrentConcurrency: current, CurrentMinuteRequests: minuteUsage[key.ID]}
-			if matchesKeyStatusFilter(view, r.URL.Query().Get("status")) {
+			if matchesKeyStatusFilter(view, r.URL.Query().Get("status")) && matchesResponseCodeFilter(view.LastStatusCode, r.URL.Query().Get("responseCode")) {
 				views = append(views, view)
 			}
 		}
@@ -710,7 +710,20 @@ func (h *Handler) keyByID(w http.ResponseWriter, r *http.Request) {
 		respond(w, key, err)
 	case action == "capture" && r.Method == http.MethodGet:
 		capture, err := h.store.GetCapture(id)
-		respond(w, capture, err)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		key, err := h.store.GetKey(id)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		respond(w, struct {
+			store.Capture
+			CurrentAPIKey string `json:"currentApiKey"`
+		}{capture, key.APIKey}, nil)
 	case action == "models" && r.Method == http.MethodGet:
 		h.keyModels(w, r, id)
 	case action == "test" && r.Method == http.MethodPost:
@@ -720,6 +733,21 @@ func (h *Handler) keyByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+func matchesResponseCodeFilter(code int, filter string) bool {
+	filter = strings.ToLower(strings.TrimSpace(filter))
+	if filter == "" || filter == "all" {
+		return true
+	}
+	if filter == "none" {
+		return code == 0
+	}
+	if len(filter) == 3 && filter[1:] == "xx" && filter[0] >= '1' && filter[0] <= '5' {
+		return code/100 == int(filter[0]-'0')
+	}
+	want, err := strconv.Atoi(filter)
+	return err == nil && want >= 100 && want <= 599 && code == want
 }
 
 func matchesKeyStatusFilter(k store.KeyView, status string) bool {

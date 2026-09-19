@@ -6,12 +6,12 @@ SERVER_URL="${SERVER_URL:?SERVER_URL is required, example: http://1.2.3.4:8081}"
 PROXY_NODE_TOKEN="${PROXY_NODE_TOKEN:?PROXY_NODE_TOKEN is required}"
 VPS_FILE="${VPS_FILE:-$ROOT_DIR/vps.txt}"
 BIN="${BIN:-$ROOT_DIR/dist/proxy-client-linux-amd64}"
-LISTEN_ADDR="${LISTEN_ADDR:-:9070}"
+LISTEN_ADDR="${LISTEN_ADDR:-:9080}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-100}"
 SSH_OPTS="${SSH_OPTS:-}"
 SCP_OPTS="${SCP_OPTS:-}"
-REMOTE_BIN="/usr/local/bin/api-fucker-proxy"
-SERVICE_NAME="api-fucker-proxy"
+REMOTE_BIN="/usr/local/bin/agnes-fucker-proxy"
+SERVICE_NAME="agnes-fucker-proxy"
 
 if [[ ! -f "$BIN" ]]; then
   echo "binary not found: $BIN" >&2
@@ -34,7 +34,7 @@ while IFS= read -r host || [[ -n "$host" ]]; do
 
   echo "==> deploying to $host"
   # shellcheck disable=SC2086
-  scp $SCP_OPTS "$BIN" "$host:/tmp/api-fucker-proxy"
+  scp $SCP_OPTS "$BIN" "$host:/tmp/agnes-fucker-proxy"
 
   # shellcheck disable=SC2086
   ssh $SSH_OPTS "$host" \
@@ -46,9 +46,9 @@ if [[ "$(id -u)" != "0" ]]; then
   SUDO="sudo"
 fi
 
-$SUDO install -m 0755 /tmp/api-fucker-proxy "$REMOTE_BIN"
+$SUDO install -m 0755 /tmp/agnes-fucker-proxy "$REMOTE_BIN"
 
-$SUDO mkdir -p /etc/api-fucker-proxy
+$SUDO mkdir -p /etc/agnes-fucker-proxy
 tmp_env="$(mktemp)"
 cat > "$tmp_env" <<EOF
 SERVER_URL=${SERVER_URL}
@@ -56,31 +56,31 @@ PROXY_NODE_TOKEN=${PROXY_NODE_TOKEN}
 LISTEN_ADDR=${LISTEN_ADDR}
 MAX_CONCURRENCY=${MAX_CONCURRENCY}
 EOF
-$SUDO install -m 0600 "$tmp_env" /etc/api-fucker-proxy/proxy.env
+$SUDO install -m 0600 "$tmp_env" /etc/agnes-fucker-proxy/proxy.env
 rm -f "$tmp_env"
 
 tmp_service="$(mktemp)"
 cat > "$tmp_service" <<EOF
 [Unit]
-Description=api-fucker VPS Proxy Client
+Description=agnes-fucker VPS Proxy Client
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/api-fucker-proxy/proxy.env
-Environment=NODE_ID_FILE=/var/lib/api-fucker-proxy/node-id
+EnvironmentFile=/etc/agnes-fucker-proxy/proxy.env
+Environment=NODE_ID_FILE=/var/lib/agnes-fucker-proxy/node-id
 ExecStart=${REMOTE_BIN}
 Restart=always
 RestartSec=3
 User=root
-StateDirectory=api-fucker-proxy
+StateDirectory=agnes-fucker-proxy
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/api-fucker-proxy
+ReadWritePaths=/var/lib/agnes-fucker-proxy
 
 [Install]
 WantedBy=multi-user.target
@@ -93,7 +93,7 @@ $SUDO systemctl enable --now "$SERVICE_NAME"
 $SUDO systemctl restart "$SERVICE_NAME"
 
 if command -v ufw >/dev/null 2>&1; then
-  $SUDO ufw allow 9070/tcp >/dev/null || true
+  $SUDO ufw allow 9080/tcp >/dev/null || true
 fi
 
 $SUDO systemctl --no-pager --full status "$SERVICE_NAME" | sed -n '1,12p'
