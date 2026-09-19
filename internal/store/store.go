@@ -52,6 +52,8 @@ type GlobalConfig struct {
 	QueueTimeoutMS          int       `json:"queueTimeoutMs"`
 	KeyMaxRequestsPerMinute int       `json:"keyMaxRequestsPerMinute"`
 	LaunchIntervalMS        int       `json:"launchIntervalMs"`
+	Key429Threshold         int       `json:"key429Threshold"`
+	Key429CooldownMinutes   int       `json:"key429CooldownMinutes"`
 	KeyAutoPauseEnabled     bool      `json:"keyAutoPauseEnabled"`
 	KeyAutoPauseThreshold   int       `json:"keyAutoPauseThreshold"`
 	UpdatedAt               time.Time `json:"updatedAt"`
@@ -66,6 +68,9 @@ type Key struct {
 	MaxConcurrency    int       `json:"maxConcurrency"`
 	Enabled           bool      `json:"enabled"`
 	Paused            bool      `json:"paused"`
+	Consecutive429    int       `json:"consecutive429"`
+	RateLimitedUntil  time.Time `json:"rateLimitedUntil"`
+	ManualPaused      bool      `json:"manualPaused"`
 	BalanceDepleted   bool      `json:"balanceDepleted"`
 	ConsecutiveErrors int       `json:"consecutiveErrors"`
 	LastError         string    `json:"lastError"`
@@ -77,10 +82,13 @@ type Key struct {
 	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
+func (k Key) IsRateLimited(now time.Time) bool { return now.Before(k.RateLimitedUntil) }
+
 type KeyView struct {
 	Key
-	CurrentConcurrency    int `json:"currentConcurrency"`
-	CurrentMinuteRequests int `json:"currentMinuteRequests"`
+	RateLimited           bool `json:"rateLimited"`
+	CurrentConcurrency    int  `json:"currentConcurrency"`
+	CurrentMinuteRequests int  `json:"currentMinuteRequests"`
 }
 
 type ImportKeyInput struct {
@@ -266,6 +274,9 @@ func (s *Store) GlobalConfig() (GlobalConfig, error) {
 }
 
 func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
+	if cfg.Key429Threshold < 0 || cfg.Key429CooldownMinutes < 0 || int64(cfg.Key429CooldownMinutes) > int64((1<<63-1)/time.Minute) {
+		return fmt.Errorf("429 threshold and cooldown must be positive and cooldown must not overflow")
+	}
 	if cfg.KeyAutoPauseThreshold < 0 {
 		return fmt.Errorf("key auto-pause threshold cannot be negative")
 	}
@@ -315,6 +326,8 @@ func normalizeProxyMode(mode string) string {
 
 func defaultGlobalConfig() GlobalConfig {
 	return GlobalConfig{
+		Key429Threshold:       1,
+		Key429CooldownMinutes: 10,
 		KeyAutoPauseEnabled:   true,
 		KeyAutoPauseThreshold: defaultKeyAutoPauseThreshold,
 		UpdatedAt:             time.Now().UTC(),
@@ -322,6 +335,12 @@ func defaultGlobalConfig() GlobalConfig {
 }
 
 func normalizeGlobalConfig(cfg GlobalConfig) GlobalConfig {
+	if cfg.Key429Threshold == 0 {
+		cfg.Key429Threshold = 1
+	}
+	if cfg.Key429CooldownMinutes == 0 {
+		cfg.Key429CooldownMinutes = 10
+	}
 	if cfg.KeyAutoPauseThreshold == 0 {
 		cfg.KeyAutoPauseEnabled = true
 		cfg.KeyAutoPauseThreshold = defaultKeyAutoPauseThreshold
@@ -498,6 +517,50 @@ func (s *Store) UpdateKeysMaxConcurrency(ids []string, maxConcurrency int) (Bulk
 	return result, err
 }
 
+// PauseKeys updates only key metadata; it never reads request captures.
+// A nil/empty ID list means all keys, matching the other bulk store operations.
+func (s *Store) PauseKeys(ids []string) (BulkUpdateResult, error) {
+	result := BulkUpdateResult{}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(keysBucket))
+		targets := make(map[string]struct{}, len(ids))
+		if len(ids) == 0 {
+			if err := b.ForEach(func(id, _ []byte) error { targets[string(id)] = struct{}{}; return nil }); err != nil {
+				return err
+			}
+		} else {
+			for _, id := range ids {
+				targets[id] = struct{}{}
+			}
+		}
+		for id := range targets {
+			raw := b.Get([]byte(id))
+			if raw == nil {
+				continue
+			}
+			var key Key
+			if err := json.Unmarshal(raw, &key); err != nil {
+				return err
+			}
+			if key.ManualPaused {
+				continue
+			}
+			key.ManualPaused = true
+			key.UpdatedAt = time.Now().UTC()
+			raw, err := json.Marshal(key)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(id), raw); err != nil {
+				return err
+			}
+			result.Updated++
+		}
+		return nil
+	})
+	return result, err
+}
+
 func (s *Store) DeleteKeys(ids []string) (BulkDeleteResult, error) {
 	wanted := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -601,15 +664,15 @@ func (s *Store) DeleteKey(id string) error {
 }
 
 func (s *Store) RestoreKey(id string) (Key, error) {
-	key, err := s.GetKey(id)
-	if err != nil {
-		return Key{}, err
-	}
-	key.Paused = false
-	key.BalanceDepleted = false
-	key.ConsecutiveErrors = 0
-	key.LastError = ""
-	return s.saveKey(key)
+	return s.mutateKey(id, func(key *Key) {
+		key.Paused = false
+		key.Consecutive429 = 0
+		key.RateLimitedUntil = time.Time{}
+		key.ManualPaused = false
+		key.BalanceDepleted = false
+		key.ConsecutiveErrors = 0
+		key.LastError = ""
+	})
 }
 
 func (s *Store) RestoreAllKeys() (int, error) {
@@ -621,9 +684,12 @@ func (s *Store) RestoreAllKeys() (int, error) {
 			if err := json.Unmarshal(raw, &key); err != nil {
 				return err
 			}
-			if !key.Paused && !key.BalanceDepleted && key.ConsecutiveErrors == 0 && key.LastError == "" {
+			if !key.ManualPaused && !key.Paused && !key.BalanceDepleted && key.Consecutive429 == 0 && key.RateLimitedUntil.IsZero() && key.ConsecutiveErrors == 0 && key.LastError == "" {
 				return nil
 			}
+			key.Consecutive429 = 0
+			key.RateLimitedUntil = time.Time{}
+			key.ManualPaused = false
 			key.Paused = false
 			key.BalanceDepleted = false
 			key.ConsecutiveErrors = 0
@@ -644,45 +710,82 @@ func (s *Store) RestoreAllKeys() (int, error) {
 }
 
 func (s *Store) RecordSuccess(id string, responseMS ...int64) error {
-	key, err := s.GetKey(id)
-	if err != nil {
-		return err
-	}
-	key.ConsecutiveErrors = 0
-	key.LastError = ""
-	key.LastUsedAt = time.Now().UTC()
-	if len(responseMS) > 0 {
-		value := responseMS[0]
-		key.LastResponseMS = &value
-	}
-	_, err = s.saveKey(key)
+	_, err := s.mutateKey(id, func(key *Key) {
+		reset429Sequence(key, time.Now().UTC())
+		key.ConsecutiveErrors = 0
+		key.LastError = ""
+		key.LastUsedAt = time.Now().UTC()
+		if len(responseMS) > 0 {
+			value := responseMS[0]
+			key.LastResponseMS = &value
+		}
+	})
 	return err
 }
 
 func (s *Store) RecordFailure(id, message string, balanceDepleted bool, responseMS ...int64) (Key, error) {
-	key, err := s.GetKey(id)
-	if err != nil {
-		return Key{}, err
-	}
 	cfg, err := s.GlobalConfig()
 	if err != nil {
 		return Key{}, err
 	}
-	key.ConsecutiveErrors++
-	key.LastError = message
-	key.LastUsedAt = time.Now().UTC()
-	if len(responseMS) > 0 {
-		value := responseMS[0]
-		key.LastResponseMS = &value
+	return s.mutateKey(id, func(key *Key) {
+		reset429Sequence(key, time.Now().UTC())
+		key.ConsecutiveErrors++
+		key.LastError = message
+		key.LastUsedAt = time.Now().UTC()
+		if len(responseMS) > 0 {
+			value := responseMS[0]
+			key.LastResponseMS = &value
+		}
+		if balanceDepleted {
+			key.BalanceDepleted = true
+			key.Paused = true
+		}
+		if cfg.KeyAutoPauseEnabled && key.ConsecutiveErrors >= cfg.KeyAutoPauseThreshold {
+			key.Paused = true
+		}
+	})
+}
+
+// Cooldown expiry is checked lazily; no capture scans or background writes.
+func reset429Sequence(key *Key, now time.Time) {
+	key.Consecutive429 = 0
+	if !key.IsRateLimited(now) {
+		key.RateLimitedUntil = time.Time{}
 	}
-	if balanceDepleted {
-		key.BalanceDepleted = true
-		key.Paused = true
+}
+
+// RecordNon429 is used by model-list requests, which do not record generation metrics.
+func (s *Store) RecordNon429(id string, status int) error {
+	_, err := s.mutateKey(id, func(key *Key) { reset429Sequence(key, time.Now().UTC()) }, status)
+	return err
+}
+
+func (s *Store) RecordRateLimit(id, message string, responseMS int64) (Key, error) {
+	cfg, err := s.GlobalConfig()
+	if err != nil {
+		return Key{}, err
 	}
-	if cfg.KeyAutoPauseEnabled && key.ConsecutiveErrors >= cfg.KeyAutoPauseThreshold {
-		key.Paused = true
-	}
-	return s.saveKey(key)
+	return s.recordRateLimitAt(id, message, responseMS, cfg, time.Now().UTC())
+}
+
+func (s *Store) recordRateLimitAt(id, message string, responseMS int64, cfg GlobalConfig, now time.Time) (Key, error) {
+	return s.mutateKey(id, func(key *Key) {
+		key.LastError = message
+		key.LastUsedAt = now
+		key.LastResponseMS = &responseMS
+		key.ConsecutiveErrors = 0
+		if key.IsRateLimited(now) {
+			return
+		}
+		if !key.RateLimitedUntil.IsZero() {
+			reset429Sequence(key, now)
+		}
+		key.Consecutive429++
+		if key.Consecutive429 >= cfg.Key429Threshold {
+			key.RateLimitedUntil = now.Add(time.Duration(cfg.Key429CooldownMinutes) * time.Minute)
+		}
+	}, 429)
 }
 
 func (s *Store) SaveCapture(c Capture) error {
@@ -1081,17 +1184,36 @@ func metricTruncator(granularity string) func(time.Time) time.Time {
 	}
 }
 
-func (s *Store) saveKey(key Key) (Key, error) {
-	key.UpdatedAt = time.Now().UTC()
-	if err := ValidateKey(key); err != nil {
-		return Key{}, err
-	}
+// mutateKey reads and writes state in one transaction so in-flight results
+// cannot overwrite a concurrent manual pause or configuration edit.
+func (s *Store) mutateKey(id string, mutate func(*Key), responseStatus ...int) (Key, error) {
+	var key Key
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(keysBucket))
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(raw, &key); err != nil {
+			return err
+		}
+		mutate(&key)
+		key.UpdatedAt = time.Now().UTC()
 		raw, err := json.Marshal(key)
 		if err != nil {
 			return err
 		}
-		return tx.Bucket([]byte(keysBucket)).Put([]byte(key.ID), raw)
+		if err := b.Put([]byte(id), raw); err != nil {
+			return err
+		}
+		if len(responseStatus) > 0 {
+			status, err := json.Marshal(responseStatus[0])
+			if err != nil {
+				return err
+			}
+			return tx.Bucket([]byte(captureStatusBucket)).Put([]byte(id), status)
+		}
+		return nil
 	})
 	return key, err
 }

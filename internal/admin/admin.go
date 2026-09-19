@@ -159,6 +159,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.importKeys(w, r)
 	case r.URL.Path == "/api/admin/keys/concurrency":
 		h.bulkUpdateConcurrency(w, r)
+	case r.URL.Path == "/api/admin/keys/pause":
+		h.bulkPauseKeys(w, r)
 	case r.URL.Path == "/api/admin/keys/delete":
 		h.bulkDeleteKeys(w, r)
 	case r.URL.Path == "/api/admin/keys/restore-all":
@@ -192,6 +194,25 @@ func (h *Handler) bulkUpdateConcurrency(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	result, err := h.store.UpdateKeysMaxConcurrency(ids, req.MaxConcurrency)
+	respond(w, result, err)
+}
+
+func (h *Handler) bulkPauseKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req bulkDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	ids, ok := bulkTargetIDs(req.IDs, req.All)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no keys selected"})
+		return
+	}
+	result, err := h.store.PauseKeys(ids)
 	respond(w, result, err)
 }
 
@@ -600,16 +621,17 @@ func (h *Handler) keys(w http.ResponseWriter, r *http.Request) {
 		minuteUsage := h.keyMinuteUsage()
 		views := make([]store.KeyView, 0, len(keys))
 		stats := keyListStats{Total: len(keys)}
+		now := time.Now()
 		for _, key := range keys {
 			current := inflight[key.ID]
-			if key.Enabled && !key.Paused && !key.BalanceDepleted {
+			if key.Enabled && !key.ManualPaused && !key.Paused && !key.BalanceDepleted && !key.IsRateLimited(now) {
 				stats.Healthy++
 			}
-			if key.Paused || key.BalanceDepleted {
+			if key.ManualPaused || key.Paused || key.BalanceDepleted || key.IsRateLimited(now) {
 				stats.Paused++
 			}
 			stats.Inflight += current
-			view := store.KeyView{Key: key, CurrentConcurrency: current, CurrentMinuteRequests: minuteUsage[key.ID]}
+			view := store.KeyView{Key: key, RateLimited: key.IsRateLimited(now), CurrentConcurrency: current, CurrentMinuteRequests: minuteUsage[key.ID]}
 			if matchesKeyStatusFilter(view, r.URL.Query().Get("status")) && matchesResponseCodeFilter(view.LastStatusCode, r.URL.Query().Get("responseCode")) {
 				views = append(views, view)
 			}
@@ -755,9 +777,13 @@ func matchesKeyStatusFilter(k store.KeyView, status string) bool {
 	case "", "all":
 		return true
 	case "routable":
-		return k.Enabled && !k.Paused && !k.BalanceDepleted
+		return k.Enabled && !k.ManualPaused && !k.Paused && !k.BalanceDepleted && !k.RateLimited
 	case "unavailable":
-		return !k.Enabled || k.Paused || k.BalanceDepleted
+		return !k.Enabled || k.ManualPaused || k.Paused || k.BalanceDepleted || k.RateLimited
+	case "rateLimited":
+		return k.RateLimited
+	case "manualPaused":
+		return k.ManualPaused
 	case "error":
 		return k.ConsecutiveErrors > 0 || strings.TrimSpace(k.LastError) != ""
 	default:

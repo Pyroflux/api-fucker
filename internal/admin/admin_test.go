@@ -473,3 +473,68 @@ func TestResponseCodeFilterAndCaptureCredentials(t *testing.T) {
 		}
 	}
 }
+
+func TestBulkManualPauseAndFilter(t *testing.T) {
+	h, closeStore := newTestHandler(t, "token")
+	defer closeStore()
+	a, err := h.store.CreateKey(store.Key{Name: "a", APIKey: "test-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.store.CreateKey(store.Key{Name: "b", APIKey: "test-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		method, body, token string
+		status              int
+	}{
+		{"POST", `{"all":true}`, "", 401},
+		{"GET", ``, "token", 405},
+		{"POST", `{`, "token", 400},
+		{"POST", `{}`, "token", 400},
+		{"POST", `{"ids":[" "]}`, "token", 400},
+		{"POST", `{"ids":["` + a.ID + `"]}`, "token", 200},
+	} {
+		req := httptest.NewRequest(tc.method, "/api/admin/keys/pause", strings.NewReader(tc.body))
+		if tc.token != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+		}
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, req)
+		if res.Code != tc.status {
+			t.Fatalf("%s %s: %d want %d", tc.method, tc.body, res.Code, tc.status)
+		}
+	}
+	other, _ := h.store.GetKey(b.ID)
+	if other.ManualPaused {
+		t.Fatal("unselected key paused")
+	}
+	for _, filter := range []string{"manualPaused", "unavailable", "routable"} {
+		req := httptest.NewRequest("GET", "/api/admin/keys?status="+filter, nil)
+		req.Header.Set("Authorization", "Bearer token")
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, req)
+		var data keyListResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.Total != 1 || data.Stats.Paused != 1 || data.Stats.Healthy != 1 {
+			t.Fatalf("filter %s: %+v", filter, data)
+		}
+		if (filter == "manualPaused" || filter == "unavailable") && data.Items[0].ID != a.ID {
+			t.Fatal("wrong paused key")
+		}
+	}
+	req := httptest.NewRequest("POST", "/api/admin/keys/pause", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Authorization", "Bearer token")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != 200 {
+		t.Fatalf("pause all: %d", res.Code)
+	}
+	other, _ = h.store.GetKey(b.ID)
+	if !other.ManualPaused {
+		t.Fatal("all did not pause remaining key")
+	}
+}

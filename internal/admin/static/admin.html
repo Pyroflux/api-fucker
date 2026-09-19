@@ -689,6 +689,8 @@
                 <option value="routable">可路由</option>
                 <option value="unavailable">不可用</option>
                 <option value="error">有错误</option>
+                <option value="manualPaused">手动暂停</option>
+                <option value="rateLimited">临时限流</option>
               </select>
             </label>
             <label>响应码
@@ -730,6 +732,7 @@
             <button id="bulkSelectAllButton" class="ghost" type="button" onclick="selectAllKeys()">选择全部 Key</button>
             <button class="ghost" type="button" onclick="clearBulkSelection()">清空选择</button>
             <button class="secondary" type="button" onclick="openBulkConcurrencyDialog()">调整并发</button>
+            <button id="bulkPauseButton" class="secondary" type="button" onclick="bulkPauseKeys()">暂停选中</button>
             <button class="danger" type="button" onclick="openBulkDeleteDialog()">删除选中</button>
           </div>
         </div>
@@ -881,6 +884,13 @@
           <label>单 Key 每分钟上限
             <input id="keyMaxRequestsPerMinute" type="number" min="0" step="1" placeholder="0 表示不限制">
           </label>
+          <label>连续 429 触发次数
+            <input id="key429Threshold" type="number" min="1" step="1" value="1">
+          </label>
+          <label>429 冷却时长（分钟）
+            <input id="key429CooldownMinutes" type="number" min="1" step="1" value="10">
+          </label>
+          <p class="muted" style="grid-column:1 / -1">429 仅触发临时限流，不计入连续失败自动暂停；连续达到设定次数后停止分配新请求，冷却到期自动恢复。非 429 结果清零连续次数，取消请求不计数。冷却期间仍可手动测试，测试成功不会提前解除冷却。</p>
           <label>连续失败自动暂停
             <span class="checkbox-control"><input id="keyAutoPauseEnabled" type="checkbox" onchange="syncKeyAutoPauseControl()">启用</span>
           </label>
@@ -1302,6 +1312,8 @@
       setValue("keyMaxRequestsPerMinute", String(cfg.keyMaxRequestsPerMinute || 0));
       el("keyAutoPauseEnabled").checked = cfg.keyAutoPauseEnabled !== false;
       setValue("keyAutoPauseThreshold", String(cfg.keyAutoPauseThreshold || 3));
+      setValue("key429Threshold", String(cfg.key429Threshold || 1));
+      setValue("key429CooldownMinutes", String(cfg.key429CooldownMinutes || 10));
       syncKeyAutoPauseControl();
       setValue("launchIntervalMs", String(cfg.launchIntervalMs || 0));
       setValue("ipAllowlist", joinRules(cfg.ipAllowlist || []));
@@ -1309,6 +1321,12 @@
     }
 
     async function saveConfig() {
+      const key429Threshold = Number(value("key429Threshold"));
+      const key429CooldownMinutes = Number(value("key429CooldownMinutes"));
+      if (!Number.isSafeInteger(key429Threshold) || key429Threshold < 1 || !Number.isSafeInteger(key429CooldownMinutes) || key429CooldownMinutes < 1 || key429CooldownMinutes > 153722867) {
+        toast("429 触发次数和冷却分钟数必须为正整数，冷却分钟数不能超过 153722867", "error");
+        return;
+      }
       const keyAutoPauseThreshold = Number(value("keyAutoPauseThreshold") || "0");
       if (!Number.isInteger(keyAutoPauseThreshold) || keyAutoPauseThreshold <= 0) {
         toast("连续失败暂停次数必须是大于 0 的整数", "error");
@@ -1330,6 +1348,8 @@
             keyMaxRequestsPerMinute: Number(value("keyMaxRequestsPerMinute") || "0"),
             keyAutoPauseEnabled: el("keyAutoPauseEnabled").checked,
             keyAutoPauseThreshold,
+            key429Threshold,
+            key429CooldownMinutes,
             launchIntervalMs: Number(value("launchIntervalMs") || "0"),
             ipAllowlist: splitRules(value("ipAllowlist")),
             ipBlocklist: splitRules(value("ipBlocklist"))
@@ -1591,7 +1611,7 @@
     }
 
     async function restoreAllKeys() {
-      if (!confirm("确认恢复全部 Key？这会清除所有暂停、余额不足和错误计数状态。")) return;
+      if (!confirm("确认恢复全部 Key？这会清除所有暂停、临时限流、余额不足和错误计数状态。")) return;
       try {
         const result = await api("/api/admin/keys/restore-all", { method: "POST" });
         await loadAll(false);
@@ -1622,6 +1642,22 @@
     function bulkTargetLabel(target = bulkTargetPayload()) {
       if (!target) return "";
       return target.all ? `全部 ${allTargetCount()} 个 Key` : `选中的 ${target.ids.length} 个 Key`;
+    }
+
+    async function bulkPauseKeys() {
+      const target = bulkTargetPayload();
+      if (!target || !confirm(`确认手动暂停${bulkTargetLabel(target)}？暂停后不再分配新请求，已有请求继续完成。`)) return;
+      el("bulkPauseButton").disabled = true;
+      try {
+        const result = await api("/api/admin/keys/pause", { method: "POST", body: JSON.stringify(target) });
+        clearBulkSelection(false);
+        await loadAll(false);
+        toast(`已手动暂停 ${result.updated} 个 Key`);
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        el("bulkPauseButton").disabled = false;
+      }
     }
 
     function openBulkConcurrencyDialog() {
@@ -1926,7 +1962,7 @@
           <td class="mono">${maskKey(k.apiKey)}</td>
           <td class="truncate">${escapeHtml(k.baseUrl || "使用全局")}</td>
           <td class="truncate">${escapeHtml(k.proxyUrl || "使用全局")}</td>
-          <td>${statusPill(k)}</td>
+          <td>${statusPill(k)}${k.rateLimited ? `<div class="muted">冷却至 ${formatDateTime(k.rateLimitedUntil)}</div>` : ""}</td>
           <td>${k.currentConcurrency || 0}/${k.maxConcurrency}</td>
           <td>${k.currentMinuteRequests || 0}/${Number(globalConfig.keyMaxRequestsPerMinute) > 0 ? globalConfig.keyMaxRequestsPerMinute : "-"}</td>
           <td>${formatDuration(k.lastFirstByteMs)}</td>
@@ -2007,9 +2043,11 @@
     }
 
     function statusPill(k) {
+      if (k.manualPaused) return `<span class="pill warn">手动暂停</span>`;
       if (!k.enabled) return `<span class="pill warn">停用</span>`;
       if (k.balanceDepleted) return `<span class="pill bad">余额不足</span>`;
       if (k.paused) return `<span class="pill bad">暂停</span>`;
+      if (k.rateLimited) return `<span class="pill warn">临时限流</span>`;
       return `<span class="pill">可用</span>`;
     }
 

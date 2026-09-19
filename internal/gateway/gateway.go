@@ -208,6 +208,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	status, respHeader, respBody, forwardErr := g.forward(r.Context(), selected, r.Method, upstreamPath, body, isStream, w, progress.emit)
 	capture.DurationMS = time.Since(start).Milliseconds()
+	g.recordUpstreamResult(selected.key.ID, status, respBody, forwardErr, capture.DurationMS, isManagedGeneration)
 	capture.StatusCode = status
 	capture.ResponseHeader = redactHeader(respHeader)
 	capture.ResponseBody = captureResponseBody(upstreamPath, respBody)
@@ -223,23 +224,40 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			FirstByteMS: firstByteElapsedMS(capture.NetworkEvents),
 			Concurrency: g.totalConcurrency(),
 			QueueDepth:  g.consumeQueuePeak(),
-			Error:       !errors.Is(forwardErr, context.Canceled) && (forwardErr != nil || status >= 400),
+			Error:       status == http.StatusTooManyRequests || (!errors.Is(forwardErr, context.Canceled) && (forwardErr != nil || status >= 400)),
 		})
-
-		if errors.Is(forwardErr, context.Canceled) {
-			return
-		}
-		if forwardErr != nil {
-			_, _ = g.store.RecordFailure(selected.key.ID, forwardErr.Error(), false, capture.DurationMS)
-			return
-		}
-		if status >= 400 {
-			msg := truncate(string(respBody), 1000)
-			_, _ = g.store.RecordFailure(selected.key.ID, msg, looksBalanceDepleted(status, respBody), capture.DurationMS)
-			return
-		}
-		_ = g.store.RecordSuccess(selected.key.ID, capture.DurationMS)
 	}
+}
+
+// Called exactly once per logical upstream request, before saving large captures.
+func (g *Gateway) recordUpstreamResult(id string, status int, body []byte, err error, durationMS int64, generation bool) {
+	if g.store == nil {
+		return
+	}
+	if status == http.StatusTooManyRequests {
+		message := truncate(string(body), 1000)
+		if message == "" {
+			message = "upstream returned HTTP 429"
+		}
+		_, _ = g.store.RecordRateLimit(id, message, durationMS)
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if !generation {
+		_ = g.store.RecordNon429(id, status)
+		return
+	}
+	if err != nil {
+		_, _ = g.store.RecordFailure(id, err.Error(), false, durationMS)
+		return
+	}
+	if status >= 400 {
+		_, _ = g.store.RecordFailure(id, truncate(string(body), 1000), looksBalanceDepleted(status, body), durationMS)
+		return
+	}
+	_ = g.store.RecordSuccess(id, durationMS)
 }
 
 func (g *Gateway) acquireGlobalSlot(ctx context.Context, cfg store.GlobalConfig) (func(), error) {
@@ -482,7 +500,7 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 
 	candidates := make([]store.Key, 0, len(keys))
 	for _, key := range keys {
-		if !key.Enabled || key.Paused || key.BalanceDepleted {
+		if !key.Enabled || key.ManualPaused || key.Paused || key.BalanceDepleted || key.IsRateLimited(now) {
 			continue
 		}
 		if g.inflight[key.ID] >= key.MaxConcurrency {
@@ -583,7 +601,7 @@ func (g *Gateway) forward(ctx context.Context, selected selectedKey, method stri
 		status, header, respBody, err := g.doBufferedWithProgress(ctx, selected, method, upstreamPath, body, progress)
 		if err != nil {
 			http.Error(w, "upstream request failed", http.StatusBadGateway)
-			return 0, nil, nil, err
+			return status, header, respBody, err
 		}
 		copyResponseHeader(w.Header(), header)
 		w.WriteHeader(status)
@@ -663,7 +681,9 @@ func (g *Gateway) ListModelsForKey(ctx context.Context, key store.Key, cfg store
 	if err != nil {
 		return ModelListResult{}, err
 	}
+	start := time.Now()
 	status, _, body, err := g.doBuffered(ctx, selected, http.MethodGet, modelsPath, nil)
+	g.recordUpstreamResult(key.ID, status, body, err, time.Since(start).Milliseconds(), false)
 	if err != nil {
 		return ModelListResult{}, err
 	}
@@ -720,6 +740,7 @@ func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg st
 	start := time.Now()
 	status, header, respBody, forwardErr := g.doBufferedWithProgress(ctx, selected, http.MethodPost, chatPath, body, captureProgress.emit)
 	capture.DurationMS = time.Since(start).Milliseconds()
+	g.recordUpstreamResult(key.ID, status, respBody, forwardErr, capture.DurationMS, true)
 	capture.StatusCode = status
 	capture.ResponseHeader = redactHeader(header)
 	capture.ResponseBody = string(respBody)
@@ -732,15 +753,6 @@ func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg st
 	if g.store != nil {
 		emitProgress(progress, TestProgressEvent{Step: "record", Message: "写入测试结果和 Key 状态"})
 		_ = g.store.SaveCapture(capture)
-		if errors.Is(forwardErr, context.Canceled) {
-			// Cancellation must not change the key's failure or success state.
-		} else if forwardErr != nil {
-			_, _ = g.store.RecordFailure(key.ID, forwardErr.Error(), false, capture.DurationMS)
-		} else if status >= 400 {
-			_, _ = g.store.RecordFailure(key.ID, truncate(string(respBody), 1000), looksBalanceDepleted(status, respBody), capture.DurationMS)
-		} else {
-			_ = g.store.RecordSuccess(key.ID, capture.DurationMS)
-		}
 	}
 	result := UpstreamTestResult{
 		StatusCode:     status,

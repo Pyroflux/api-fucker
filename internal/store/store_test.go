@@ -1,8 +1,11 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -716,5 +719,137 @@ func TestDeleteKeysRemovesCaptureStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 		st.Close()
+	}
+}
+
+func TestManualPausePreservedAcrossResultsAndEdits(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key, err := st.CreateKey(Key{Name: "manual", APIKey: "test-placeholder"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := st.PauseKeys([]string{key.ID, key.ID, "missing"})
+	if err != nil || result.Updated != 1 {
+		t.Fatalf("pause: %+v %v", result, err)
+	}
+	if _, err = st.UpdateKey(key.ID, key); err != nil {
+		t.Fatal(err)
+	} // stale edit must preserve pause
+	if err = st.RecordSuccess(key.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.RecordFailure(key.ID, "test error", false); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := st.GetKey(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.ManualPaused || saved.Paused {
+		t.Fatal("manual pause must remain distinct from automatic pause")
+	}
+	if _, err = st.RestoreKey(key.ID); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ = st.GetKey(key.ID)
+	if saved.ManualPaused {
+		t.Fatal("restore must clear manual pause")
+	}
+	// Concurrent completion cannot replace the manual-pause state with a stale copy.
+	for i := 0; i < 20; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := st.RecordSuccess(key.ID); err != nil {
+				t.Error(err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := st.PauseKeys([]string{key.ID}); err != nil {
+				t.Error(err)
+			}
+		}()
+		wg.Wait()
+		saved, _ = st.GetKey(key.ID)
+		if !saved.ManualPaused {
+			t.Fatal("in-flight success lost manual pause")
+		}
+		if _, err = st.RestoreKey(key.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestBulkPauseAtProductionKeyCount(t *testing.T) {
+	st, err := Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ids := make([]string, 1067)
+	if err := st.db.Update(func(tx *bolt.Tx) error {
+		for i := 0; i < 7300; i++ {
+			id := fmt.Sprintf("key-%05d", i)
+			raw, err := json.Marshal(Key{ID: id, Name: id, APIKey: "test-placeholder", Enabled: true, MaxConcurrency: 1})
+			if err != nil {
+				return err
+			}
+			if err := tx.Bucket([]byte(keysBucket)).Put([]byte(id), raw); err != nil {
+				return err
+			}
+			// Unreadable captures prove that pause and listing never parse details.
+			if err := tx.Bucket([]byte(captureBucket)).Put([]byte(id), []byte("not JSON")); err != nil {
+				return err
+			}
+			if i < len(ids) {
+				ids[i] = id
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	result, err := st.PauseKeys(ids)
+	if err != nil || result.Updated != len(ids) {
+		t.Fatalf("pause %+v %v", result, err)
+	}
+	t.Logf("pause 1067 of 7300 keys: %s", time.Since(start))
+	start = time.Now()
+	keys, err := st.ListKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("list 7300 keys: %s", time.Since(start))
+	paused := 0
+	for _, key := range keys {
+		if key.ManualPaused {
+			paused++
+		}
+	}
+	if paused != len(ids) {
+		t.Fatalf("paused %d, want %d", paused, len(ids))
+	}
+	result, err = st.PauseKeys(nil)
+	if err != nil || result.Updated != 7300-len(ids) {
+		t.Fatalf("pause all %+v %v", result, err)
+	}
+	if restored, err := st.RestoreAllKeys(); err != nil || restored != 7300 {
+		t.Fatalf("restore all %d %v", restored, err)
+	}
+	keys, err = st.ListKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		if key.ManualPaused {
+			t.Fatal("restore all retained manual pause")
+		}
 	}
 }

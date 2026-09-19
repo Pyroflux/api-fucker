@@ -94,6 +94,7 @@ docker buildx build --platform linux/amd64 -t pyroflux/api-fucker:latest .
 | VPS proxy pool | When enabled, all API traffic uses online enabled VPS proxy nodes instead of key/global proxy settings. |
 | Proxy mode | `round_robin` rotates online proxy nodes; `key_binding` keeps each upstream API key on a stable node when possible. |
 | Key auto-pause | Enabled by default with a threshold of 3 consecutive failures. It can be disabled or configured with a positive failure threshold. Balance-depleted keys are still paused immediately. |
+| HTTP 429 cooldown | Defaults to 1 consecutive 429 and a 10-minute cooldown; both are configurable. HTTP 429 triggers only temporary rate limiting, not consecutive-failure auto-pause or balance-depleted detection. |
 | Request IP allowlist | Optional list of IP patterns allowed to access `/v1/*`. Empty means allow all unless blocked. |
 | Request IP blocklist | Optional list of IP patterns denied from accessing `/v1/*`. Blocklist wins over allowlist. |
 
@@ -189,6 +190,12 @@ The admin console records the latest request details for each key:
 Image responses are returned to clients in full. To prevent Base64 image data from rapidly growing the database, the response body stored in the latest capture is limited to 64 KiB and includes the original byte count when truncated.
 
 Timeline events distinguish direct and proxied requests, including DNS resolution, proxy connection, CONNECT tunnel establishment, upstream TLS handshake, request send, first byte, response read, retry, and failure steps.
+
+### HTTP 429 Cooldown
+
+Keys enter **临时限流** after the configured number of consecutive upstream HTTP 429 responses. Non-429 outcomes reset the sequence; cancellation without an HTTP 429 does not change it. Cooling keys receive no new routed requests and become eligible automatically at their persisted deadline, including after restart. Existing disabled, manual-pause, automatic-pause, and balance-depleted states remain independent.
+
+Manual tests remain available during cooldown. Successful tests do not end cooldown early, and additional 429 responses do not extend it. Use Restore to clear cooldown immediately. Configuration changes affect future cooldowns only. The admin list supports filtering by temporary rate limit and displays the cooldown deadline. Historical captures are never scanned to initialize this state.
 
 ## Proxy Notes
 

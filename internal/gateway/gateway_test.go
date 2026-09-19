@@ -1413,3 +1413,38 @@ func TestCancellationPreservesRealError(t *testing.T) {
 		})
 	}
 }
+
+func TestManualPauseExcludesKeyFromRouting(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key, err := st.CreateKey(store.Key{Name: "manual", APIKey: "test-placeholder", BaseURL: "https://upstream.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := New(st, nil)
+	selected, err := gw.acquireKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.PauseKeys([]string{key.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.RecordSuccess(key.ID); err != nil {
+		t.Fatal(err)
+	}
+	gw.releaseSelected(selected)
+	if _, err = gw.acquireKey(); !errors.Is(err, errNoAvailableKey) {
+		t.Fatalf("manual pause still routes: %v", err)
+	}
+	if _, err = st.RestoreKey(key.ID); err != nil {
+		t.Fatal(err)
+	}
+	selected, err = gw.acquireKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.releaseSelected(selected)
+}
