@@ -612,3 +612,109 @@ func TestProxyNodeReportRegistersAndPreservesDisabledState(t *testing.T) {
 		t.Fatalf("expected node to be offline after timeout: %+v", nodes[0])
 	}
 }
+
+func TestListKeysDoesNotReadCaptureBodies(t *testing.T) {
+	path := t.TempDir() + "/data.db"
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	key, err := st.CreateKey(Key{Name: "summary", APIKey: "test-placeholder"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []int{200, 429, 0} {
+		if err := st.SaveCapture(Capture{KeyID: key.ID, StatusCode: code, ResponseBody: strings.Repeat("x", 1024*1024)}); err != nil {
+			t.Fatal(err)
+		}
+		// Even an unreadable detail must not affect listing or routing.
+		if err := st.db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket([]byte(captureBucket)).Put([]byte(key.ID), []byte("not JSON"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		keys, err := st.ListKeys()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != 1 || keys[0].LastStatusCode != code {
+			t.Fatalf("unexpected status summary: %+v", keys)
+		}
+	}
+	if err := st.SaveCapture(Capture{KeyID: key.ID, StatusCode: 503}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := st.ListKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys[0].LastStatusCode != 503 {
+		t.Fatal("summary did not survive reopen")
+	}
+	// Simulate a legacy database without the newly introduced bucket.
+	if err := st.db.Update(func(tx *bolt.Tx) error { return tx.DeleteBucket([]byte(captureStatusBucket)) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err = st.ListKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys[0].LastStatusCode != 0 {
+		t.Fatal("legacy capture must not be scanned")
+	}
+	capture, err := st.GetCapture(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capture.StatusCode != 503 {
+		t.Fatal("legacy detail must be preserved")
+	}
+}
+
+func TestDeleteKeysRemovesCaptureStatus(t *testing.T) {
+	for _, bulk := range []bool{false, true} {
+		st, err := Open(t.TempDir() + "/data.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := st.CreateKey(Key{Name: "summary", APIKey: "test-placeholder"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SaveCapture(Capture{KeyID: key.ID, StatusCode: 200}); err != nil {
+			t.Fatal(err)
+		}
+		if bulk {
+			_, err = st.DeleteKeys([]string{key.ID})
+		} else {
+			err = st.DeleteKey(key.ID)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.db.View(func(tx *bolt.Tx) error {
+			if tx.Bucket([]byte(captureStatusBucket)).Get([]byte(key.ID)) != nil {
+				t.Error("orphaned status summary")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+	}
+}

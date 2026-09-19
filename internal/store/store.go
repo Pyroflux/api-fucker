@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	keysBucket       = "keys"
-	metaBucket       = "meta"
-	captureBucket    = "captures"
-	metricsBucket    = "metrics"
-	proxyNodesBucket = "proxy_nodes"
-	globalConfigID   = "global"
-	metricsMaxAge    = 7 * 24 * time.Hour
+	keysBucket          = "keys"
+	metaBucket          = "meta"
+	captureBucket       = "captures"
+	captureStatusBucket = "capture_status"
+	metricsBucket       = "metrics"
+	proxyNodesBucket    = "proxy_nodes"
+	globalConfigID      = "global"
+	metricsMaxAge       = 7 * 24 * time.Hour
 
 	ProxyModeRoundRobin  = "round_robin"
 	ProxyModeKeyBinding  = "key_binding"
@@ -227,6 +228,9 @@ func (s *Store) init() error {
 		if _, err := tx.CreateBucketIfNotExists([]byte(captureBucket)); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists([]byte(captureStatusBucket)); err != nil {
+			return err
+		}
 		if _, err := tx.CreateBucketIfNotExists([]byte(metricsBucket)); err != nil {
 			return err
 		}
@@ -348,15 +352,13 @@ func (s *Store) ListKeys() ([]Key, error) {
 			if err := json.Unmarshal(v, &key); err != nil {
 				return err
 			}
-			// Read only the status field, including captures saved by older versions.
-			if raw := tx.Bucket([]byte(captureBucket)).Get([]byte(key.ID)); raw != nil {
-				var summary struct {
-					StatusCode int `json:"statusCode"`
-				}
-				if err := json.Unmarshal(raw, &summary); err != nil {
+			// Never parse captures here: both admin lists and request routing use ListKeys.
+			// Legacy captures acquire a summary on their next SaveCapture, without a full scan.
+			key.LastStatusCode = 0
+			if raw := tx.Bucket([]byte(captureStatusBucket)).Get([]byte(key.ID)); raw != nil {
+				if err := json.Unmarshal(raw, &key.LastStatusCode); err != nil {
 					return err
 				}
-				key.LastStatusCode = summary.StatusCode
 			}
 			keys = append(keys, key)
 			return nil
@@ -526,6 +528,9 @@ func (s *Store) DeleteKeys(ids []string) (BulkDeleteResult, error) {
 			if err := captures.Delete(id); err != nil {
 				return err
 			}
+			if err := tx.Bucket([]byte(captureStatusBucket)).Delete(id); err != nil {
+				return err
+			}
 			result.Deleted++
 		}
 		return nil
@@ -588,7 +593,10 @@ func (s *Store) DeleteKey(id string) error {
 		if err := tx.Bucket([]byte(keysBucket)).Delete([]byte(id)); err != nil {
 			return err
 		}
-		return tx.Bucket([]byte(captureBucket)).Delete([]byte(id))
+		if err := tx.Bucket([]byte(captureBucket)).Delete([]byte(id)); err != nil {
+			return err
+		}
+		return tx.Bucket([]byte(captureStatusBucket)).Delete([]byte(id))
 	})
 }
 
@@ -684,7 +692,14 @@ func (s *Store) SaveCapture(c Capture) error {
 		if err != nil {
 			return err
 		}
-		return tx.Bucket([]byte(captureBucket)).Put([]byte(c.KeyID), raw)
+		if err := tx.Bucket([]byte(captureBucket)).Put([]byte(c.KeyID), raw); err != nil {
+			return err
+		}
+		status, err := json.Marshal(c.StatusCode)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket([]byte(captureStatusBucket)).Put([]byte(c.KeyID), status)
 	})
 }
 
