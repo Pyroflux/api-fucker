@@ -21,13 +21,14 @@ import (
 var staticFS embed.FS
 
 type Handler struct {
-	store              *store.Store
-	adminToken         string
-	proxyNodeToken     string
-	currentConcurrency func() map[string]int
-	queueDepth         func() int
-	keyMinuteUsage     func() map[string]int
-	upstream           upstreamTester
+	store                *store.Store
+	adminToken           string
+	proxyNodeToken       string
+	currentConcurrency   func() map[string]int
+	queueDepth           func() int
+	keyMinuteUsage       func() map[string]int
+	keyMinuteUsageForKey func(string) int
+	upstream             upstreamTester
 }
 
 type loginRequest struct {
@@ -99,12 +100,13 @@ func New(st *store.Store, token string, currentConcurrency func() map[string]int
 		tester = upstream[0]
 	}
 	return &Handler{
-		store:              st,
-		adminToken:         normalizeAdminToken(token),
-		currentConcurrency: currentConcurrency,
-		queueDepth:         func() int { return 0 },
-		keyMinuteUsage:     func() map[string]int { return nil },
-		upstream:           tester,
+		store:                st,
+		adminToken:           normalizeAdminToken(token),
+		currentConcurrency:   currentConcurrency,
+		queueDepth:           func() int { return 0 },
+		keyMinuteUsage:       func() map[string]int { return nil },
+		keyMinuteUsageForKey: func(string) int { return 0 },
+		upstream:             tester,
 	}
 }
 
@@ -124,6 +126,14 @@ func (h *Handler) SetKeyMinuteUsage(fn func() map[string]int) {
 		fn = func() map[string]int { return nil }
 	}
 	h.keyMinuteUsage = fn
+}
+
+// SetKeyMinuteUsageForKey avoids copying the full usage map for a detail view.
+func (h *Handler) SetKeyMinuteUsageForKey(fn func(string) int) {
+	if fn == nil {
+		fn = func(string) int { return 0 }
+	}
+	h.keyMinuteUsageForKey = fn
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -731,21 +741,24 @@ func (h *Handler) keyByID(w http.ResponseWriter, r *http.Request) {
 		key, err := h.store.RestoreKey(id)
 		respond(w, key, err)
 	case action == "capture" && r.Method == http.MethodGet:
-		capture, err := h.store.GetCapture(id)
-		if err != nil {
-			respond(w, nil, err)
-			return
-		}
 		key, err := h.store.GetKey(id)
 		if err != nil {
 			respond(w, nil, err)
 			return
 		}
+		capture, err := h.store.GetCapture(id)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			respond(w, nil, err)
+			return
+		}
+		hasCapture := err == nil
 		w.Header().Set("Cache-Control", "no-store")
 		respond(w, struct {
 			store.Capture
-			CurrentAPIKey string `json:"currentApiKey"`
-		}{capture, key.APIKey}, nil)
+			CurrentAPIKey         string `json:"currentApiKey"`
+			CurrentMinuteRequests int    `json:"currentMinuteRequests"`
+			HasCapture            bool   `json:"hasCapture"`
+		}{capture, key.APIKey, h.keyMinuteUsageForKey(id), hasCapture}, nil)
 	case action == "models" && r.Method == http.MethodGet:
 		h.keyModels(w, r, id)
 	case action == "test" && r.Method == http.MethodPost:

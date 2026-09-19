@@ -34,6 +34,7 @@ func main() {
 	adminHandler.SetProxyNodeToken(proxyNodeToken)
 	adminHandler.SetQueueDepth(gw.QueueDepth)
 	adminHandler.SetKeyMinuteUsage(gw.KeyMinuteUsage)
+	adminHandler.SetKeyMinuteUsageForKey(gw.KeyMinuteUsageForKey)
 
 	apiMux := newAPIMux(gw)
 

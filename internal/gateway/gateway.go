@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +45,8 @@ type Gateway struct {
 	store *store.Store
 
 	mu              sync.Mutex
-	roundRobin      int
+	lastKeyID       string
+	lastMinuteSweep time.Time
 	proxyRoundRobin int
 	inflight        map[string]int
 	proxyInflight   map[string]int
@@ -66,9 +68,10 @@ type Gateway struct {
 // minuteCounter is a per-key sliding-window log: it stores the timestamps
 // of every request admitted in the trailing minute. A request is "in window"
 // iff its timestamp is within the last 60s of `now`. Prune drops the expired
-// prefix in-place so reads are accurate.
+// prefix lazily so reads are accurate without shifting on every admission.
 type minuteCounter struct {
 	hits []time.Time
+	head int
 }
 
 const minuteWindow = time.Minute
@@ -78,20 +81,23 @@ const minuteWindow = time.Minute
 // the expired entries are always a prefix.
 func (mc *minuteCounter) prune(now time.Time) {
 	cutoff := now.Add(-minuteWindow)
-	i := 0
-	for i < len(mc.hits) && !mc.hits[i].After(cutoff) {
-		i++
+	for mc.head < len(mc.hits) && !mc.hits[mc.head].After(cutoff) {
+		mc.head++
 	}
-	if i == 0 {
-		return
+	if mc.head == len(mc.hits) {
+		mc.hits = nil
+		mc.head = 0
+	} else if mc.head > 0 && mc.head >= len(mc.hits)/2 {
+		// Release peak-sized backing arrays as traffic subsides, amortizing copies.
+		remaining := make([]time.Time, len(mc.hits)-mc.head)
+		copy(remaining, mc.hits[mc.head:])
+		mc.hits = remaining
+		mc.head = 0
 	}
-	// Shift remaining entries to the front so the underlying array can be
-	// reused without growing without bound.
-	mc.hits = mc.hits[:copy(mc.hits, mc.hits[i:])]
 }
 
 func (mc *minuteCounter) count() int {
-	return len(mc.hits)
+	return len(mc.hits) - mc.head
 }
 
 type selectedKey struct {
@@ -400,19 +406,33 @@ func (g *Gateway) KeyMinuteUsage() map[string]int {
 	defer g.mu.Unlock()
 	now := time.Now()
 	out := make(map[string]int, len(g.keyMinute))
-	for id, mc := range g.keyMinute {
-		if mc == nil {
-			delete(g.keyMinute, id)
-			continue
+	for id := range g.keyMinute {
+		if count := g.keyMinuteCountLocked(id, now); count > 0 {
+			out[id] = count
 		}
-		mc.prune(now)
-		if mc.count() == 0 {
-			delete(g.keyMinute, id)
-			continue
-		}
-		out[id] = mc.count()
 	}
 	return out
+}
+
+// KeyMinuteUsageForKey reads only this key's in-memory rolling window.
+func (g *Gateway) KeyMinuteUsageForKey(id string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.keyMinuteCountLocked(id, time.Now())
+}
+
+func (g *Gateway) keyMinuteCountLocked(id string, now time.Time) int {
+	mc := g.keyMinute[id]
+	if mc == nil {
+		delete(g.keyMinute, id)
+		return 0
+	}
+	mc.prune(now)
+	if mc.count() == 0 {
+		delete(g.keyMinute, id)
+		return 0
+	}
+	return mc.count()
 }
 
 func routeRequest(r *http.Request) (string, string, error) {
@@ -449,27 +469,21 @@ func (g *Gateway) CurrentConcurrency() map[string]int {
 	return out
 }
 
-// pruneKeyMinuteLocked drops minuteCounter entries belonging to keys that
-// no longer exist and prunes expired hits from the remainder. After this
-// runs the candidate loop can treat `mc.count() >= rpmLimit` as a
-// sliding-window check (no further age inspection needed).
+// pruneKeyMinuteLocked sweeps at most once per minute. ListKeys already
+// supplies keys sorted by ID, so cleanup needs no additional key-set allocation.
+// Individual candidates are pruned lazily on every selection.
 func (g *Gateway) pruneKeyMinuteLocked(keys []store.Key, now time.Time) {
-	if len(g.keyMinute) == 0 {
+	if !g.lastMinuteSweep.IsZero() && now.Sub(g.lastMinuteSweep) < minuteWindow {
 		return
 	}
-	existing := make(map[string]struct{}, len(keys))
-	for _, k := range keys {
-		existing[k.ID] = struct{}{}
-	}
-	for id, mc := range g.keyMinute {
-		if _, ok := existing[id]; !ok || mc == nil {
+	g.lastMinuteSweep = now
+	for id := range g.keyMinute {
+		idx := sort.Search(len(keys), func(i int) bool { return keys[i].ID >= id })
+		if idx == len(keys) || keys[idx].ID != id {
 			delete(g.keyMinute, id)
 			continue
 		}
-		mc.prune(now)
-		if mc.count() == 0 {
-			delete(g.keyMinute, id)
-		}
+		g.keyMinuteCountLocked(id, now)
 	}
 }
 
@@ -498,28 +512,30 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 	rpmLimit := cfg.KeyMaxRequestsPerMinute
 	g.pruneKeyMinuteLocked(keys, now)
 
-	candidates := make([]store.Key, 0, len(keys))
-	for _, key := range keys {
-		if !key.Enabled || key.ManualPaused || key.Paused || key.BalanceDepleted || key.IsRateLimited(now) {
+	// Keep the cursor in the stable full key order, not in a filtered list.
+	start := sort.Search(len(keys), func(i int) bool { return keys[i].ID > g.lastKeyID })
+	var key store.Key
+	found := false
+	for offset := 0; offset < len(keys); offset++ {
+		candidate := keys[(start+offset)%len(keys)]
+		if !candidate.Enabled || candidate.ManualPaused || candidate.Paused || candidate.BalanceDepleted || candidate.IsRateLimited(now) {
 			continue
 		}
-		if g.inflight[key.ID] >= key.MaxConcurrency {
+		if g.inflight[candidate.ID] >= candidate.MaxConcurrency {
 			continue
 		}
-		if rpmLimit > 0 {
-			if mc := g.keyMinute[key.ID]; mc != nil && mc.count() >= rpmLimit {
-				continue
-			}
+		count := g.keyMinuteCountLocked(candidate.ID, now)
+		if rpmLimit > 0 && count >= rpmLimit {
+			continue
 		}
-		candidates = append(candidates, key)
+		key = candidate
+		found = true
+		break
 	}
-	if len(candidates) == 0 {
+	if !found {
 		return selectedKey{}, errNoAvailableKey
 	}
-
-	idx := g.roundRobin % len(candidates)
-	key := candidates[idx]
-	g.roundRobin++
+	g.lastKeyID = key.ID
 	g.inflight[key.ID]++
 
 	baseURL := strings.TrimSpace(cfg.UpstreamBaseURL)
@@ -547,14 +563,13 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		g.proxyInflight[node.ID]++
 	}
 
-	if rpmLimit > 0 {
-		mc := g.keyMinute[key.ID]
-		if mc == nil {
-			mc = &minuteCounter{}
-			g.keyMinute[key.ID] = mc
-		}
-		mc.hits = append(mc.hits, now)
+	// Count logical admissions even when the configured RPM limit is disabled.
+	mc := g.keyMinute[key.ID]
+	if mc == nil {
+		mc = &minuteCounter{}
+		g.keyMinute[key.ID] = mc
 	}
+	mc.hits = append(mc.hits, now)
 	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL, proxyNodeID: proxyNodeID}, nil
 }
 

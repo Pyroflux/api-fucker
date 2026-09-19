@@ -7,6 +7,7 @@
 - OpenAI-compatible forwarding for chat completions and model listing.
 - OpenAI-compatible image generation forwarding with URL and Base64 JSON responses.
 - Key pool management with enable/disable, pause/restore, balance/error tracking, and per-key concurrency limits.
+- Strict round-robin key selection in stable key-ID order, skipping unavailable keys and resuming after the last selected ID.
 - Global and per-key upstream base URL / proxy configuration.
 - HTTP proxy support with conservative HTTP/1.1 upstream transport for unstable residential proxies.
 - Managed VPS proxy pool with round-robin or per-key binding modes.
@@ -95,8 +96,11 @@ docker buildx build --platform linux/amd64 -t pyroflux/api-fucker:latest .
 | Proxy mode | `round_robin` rotates online proxy nodes; `key_binding` keeps each upstream API key on a stable node when possible. |
 | Key auto-pause | Enabled by default with a threshold of 3 consecutive failures. It can be disabled or configured with a positive failure threshold. Balance-depleted keys are still paused immediately. |
 | HTTP 429 cooldown | Defaults to 1 consecutive 429 and a 10-minute cooldown; both are configurable. HTTP 429 triggers only temporary rate limiting, not consecutive-failure auto-pause or balance-depleted detection. |
+| Per-key requests per minute | Limits logical request admissions in a rolling 60-second window; 0 disables the limit. Counts remain available in the key list and Details even when the limit is disabled. |
 | Request IP allowlist | Optional list of IP patterns allowed to access `/v1/*`. Empty means allow all unless blocked. |
 | Request IP blocklist | Optional list of IP patterns denied from accessing `/v1/*`. Blocklist wins over allowlist. |
+
+The Details view shows a snapshot of the key's recent 60-second request count, including admitted requests that later fail. Internal retries do not add to the count, and admin tests/model fetching do not participate in it. Counts are held in memory for this gateway process, reset on restart, and never reconstructed from historical captures. Opening Details for a key without a capture still shows its current count.
 
 IP rules support exact and wildcard-prefix matching:
 

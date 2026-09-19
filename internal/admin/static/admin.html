@@ -1879,11 +1879,14 @@
     function renderCapture(data) {
       el("capture").innerHTML = `
         <div class="capture-meta">
+          ${captureField("最近 1 分钟请求次数", String(data.currentMinuteRequests ?? 0))}
           ${captureField("请求地址", data.requestUrl || "-")}
           ${captureField("响应状态", String(data.statusCode || "-"))}
           ${captureField("耗时", data.durationMs != null ? formatDuration(data.durationMs) : "-")}
         </div>
+        <p class="muted">最近 60 秒，本次服务启动后统计；每个新请求计一次，不含内部重试及后台手动测试。数值为打开详情时的快照。</p>
         ${captureSection("当前 Key", data.currentApiKey || "-")}
+        ${data.hasCapture === false ? '<p class="muted">暂无请求记录</p>' : `
         <p class="muted">请求头显示该次请求使用的 Key；旧记录中的 [redacted] 无法还原，可参考上方当前 Key。</p>
         ${captureSection("请求头", formatJSON(data.requestHeader || {}))}
         ${captureSection("请求数据", formatPayload(data.requestBody))}
@@ -1891,6 +1894,7 @@
         ${captureSection("响应头", formatJSON(data.responseHeader || {}))}
         ${captureSection("响应数据", formatPayload(data.responseBody))}
         ${data.error ? captureSection("错误", data.error) : ""}
+        `}
       `;
     }
 
