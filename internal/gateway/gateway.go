@@ -49,6 +49,7 @@ type Gateway struct {
 	lastMinuteSweep time.Time
 	proxyRoundRobin int
 	inflight        map[string]int
+	activeRequests  int
 	proxyInflight   map[string]int
 	keyMinute       map[string]*minuteCounter
 	clients         map[string]*http.Client
@@ -171,9 +172,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isStream := upstreamPath == chatPath && requestWantsStream(body)
 	isManagedGeneration := isManagedGenerationPath(upstreamPath)
+	releaseGlobal := func() {}
+	defer func() { releaseGlobal() }()
 	if isManagedGeneration {
 		cfg, _ := g.store.GlobalConfig()
-		releaseGlobal, err := g.acquireGlobalSlot(r.Context(), cfg)
+		release, err := g.acquireGlobalSlot(r.Context(), cfg)
 		if err != nil {
 			status := http.StatusGatewayTimeout
 			if errors.Is(err, errGlobalQueueFull) {
@@ -182,7 +185,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), status)
 			return
 		}
-		defer releaseGlobal()
+		releaseGlobal = release
 		if err := g.waitForLaunchSlot(r.Context(), cfg.LaunchIntervalMS); err != nil {
 			http.Error(w, err.Error(), http.StatusGatewayTimeout)
 			return
@@ -198,7 +201,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
-	defer g.releaseSelected(selected)
+	released := false
+	releaseSelected := func() {
+		if !released {
+			released = true
+			g.releaseSelected(selected)
+		}
+	}
+	defer releaseSelected()
 
 	capture := store.Capture{
 		KeyID:         selected.key.ID,
@@ -206,7 +216,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RequestMethod: r.Method,
 		RequestURL:    joinURL(selected.baseURL, upstreamPath),
 		RequestHeader: redactHeader(r.Header),
-		RequestBody:   string(body),
+		RequestBody:   captureRequestBody(body),
 	}
 	progress := newCaptureProgressRecorder(nil)
 	emitRequestReady(progress.emit, selected)
@@ -216,6 +226,21 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture.DurationMS = time.Since(start).Milliseconds()
 	g.recordUpstreamResult(selected.key.ID, status, respBody, forwardErr, capture.DurationMS, isManagedGeneration)
 	capture.StatusCode = status
+	if isManagedGeneration {
+		capture = g.store.PrepareCapture(capture)
+	}
+	// Publish automatic state before freeing admission slots; disk and diagnostic
+	// serialization are deliberately outside this critical completion path.
+	concurrency := g.totalConcurrency()
+	queueDepth := 0
+	if isManagedGeneration {
+		queueDepth = g.consumeQueuePeak()
+	}
+	releaseSelected()
+	releaseGlobal()
+	releaseGlobal = func() {}
+	capture.Truncated = len(body) > store.CaptureBodyLimit || len(respBody) > store.CaptureBodyLimit
+
 	capture.ResponseHeader = redactHeader(respHeader)
 	capture.ResponseBody = captureResponseBody(upstreamPath, respBody)
 	if forwardErr != nil && !errors.Is(forwardErr, context.Canceled) {
@@ -228,8 +253,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = g.store.RecordMetric(selected.key.ID, store.MetricSample{
 			Time:        capture.Time,
 			FirstByteMS: firstByteElapsedMS(capture.NetworkEvents),
-			Concurrency: g.totalConcurrency(),
-			QueueDepth:  g.consumeQueuePeak(),
+			Concurrency: concurrency,
+			QueueDepth:  queueDepth,
 			Error:       status == http.StatusTooManyRequests || (!errors.Is(forwardErr, context.Canceled) && (forwardErr != nil || status >= 400)),
 		})
 	}
@@ -241,7 +266,7 @@ func (g *Gateway) recordUpstreamResult(id string, status int, body []byte, err e
 		return
 	}
 	if status == http.StatusTooManyRequests {
-		message := truncate(string(body), 1000)
+		message := string(body[:min(len(body), 1000)])
 		if message == "" {
 			message = "upstream returned HTTP 429"
 		}
@@ -260,7 +285,7 @@ func (g *Gateway) recordUpstreamResult(id string, status int, body []byte, err e
 		return
 	}
 	if status >= 400 {
-		_, _ = g.store.RecordFailure(id, truncate(string(body), 1000), looksBalanceDepleted(status, body), durationMS)
+		_, _ = g.store.RecordFailure(id, string(body[:min(len(body), 1000)]), looksBalanceDepleted(status, body), durationMS)
 		return
 	}
 	_ = g.store.RecordSuccess(id, durationMS)
@@ -452,8 +477,15 @@ func isManagedGenerationPath(path string) bool {
 	return path == chatPath || path == imageGenerationsPath
 }
 
+func captureRequestBody(body []byte) string {
+	if len(body) > store.CaptureBodyLimit {
+		return string(body[:store.CaptureBodyLimit]) + store.CaptureTruncationMarker
+	}
+	return string(body)
+}
+
 func captureResponseBody(path string, body []byte) string {
-	if path != imageGenerationsPath || len(body) <= imageCaptureResponseLimit {
+	if len(body) <= imageCaptureResponseLimit {
 		return string(body)
 	}
 	return string(body[:imageCaptureResponseLimit]) + fmt.Sprintf("\n...[truncated: original response body %d bytes]", len(body))
@@ -490,18 +522,10 @@ func (g *Gateway) pruneKeyMinuteLocked(keys []store.Key, now time.Time) {
 func (g *Gateway) totalConcurrency() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	total := 0
-	for _, v := range g.inflight {
-		total += v
-	}
-	return total
+	return g.activeRequests
 }
 
 func (g *Gateway) acquireKey() (selectedKey, error) {
-	keys, err := g.store.ListKeys()
-	if err != nil {
-		return selectedKey{}, err
-	}
 	cfg, _ := g.store.GlobalConfig()
 	proxyNodes, _ := g.store.ListProxyNodes(time.Now().UTC())
 
@@ -510,28 +534,20 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 
 	now := time.Now()
 	rpmLimit := cfg.KeyMaxRequestsPerMinute
-	g.pruneKeyMinuteLocked(keys, now)
-
-	// Keep the cursor in the stable full key order, not in a filtered list.
-	start := sort.Search(len(keys), func(i int) bool { return keys[i].ID > g.lastKeyID })
-	var key store.Key
-	found := false
-	for offset := 0; offset < len(keys); offset++ {
-		candidate := keys[(start+offset)%len(keys)]
+	if g.lastMinuteSweep.IsZero() || now.Sub(g.lastMinuteSweep) >= minuteWindow {
+		keys, _ := g.store.ListKeys()
+		g.pruneKeyMinuteLocked(keys, now)
+	}
+	key, found := g.store.SelectKeyAfter(g.lastKeyID, func(candidate store.Key) bool {
 		if !candidate.Enabled || candidate.ManualPaused || candidate.Paused || candidate.BalanceDepleted || candidate.IsRateLimited(now) {
-			continue
+			return false
 		}
 		if g.inflight[candidate.ID] >= candidate.MaxConcurrency {
-			continue
+			return false
 		}
 		count := g.keyMinuteCountLocked(candidate.ID, now)
-		if rpmLimit > 0 && count >= rpmLimit {
-			continue
-		}
-		key = candidate
-		found = true
-		break
-	}
+		return rpmLimit <= 0 || count < rpmLimit
+	})
 	if !found {
 		return selectedKey{}, errNoAvailableKey
 	}
@@ -570,6 +586,7 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		g.keyMinute[key.ID] = mc
 	}
 	mc.hits = append(mc.hits, now)
+	g.activeRequests++
 	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL, proxyNodeID: proxyNodeID}, nil
 }
 
@@ -578,6 +595,7 @@ func (g *Gateway) releaseSelected(selected selectedKey) {
 	defer g.mu.Unlock()
 	if g.inflight[selected.key.ID] > 0 {
 		g.inflight[selected.key.ID]--
+		g.activeRequests--
 	}
 	if selected.proxyNodeID != "" && g.proxyInflight[selected.proxyNodeID] > 0 {
 		g.proxyInflight[selected.proxyNodeID]--
@@ -1120,7 +1138,14 @@ func streamResponse(w http.ResponseWriter, resp *http.Response) (int, http.Heade
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			captured.Write(chunk)
+			if remaining := store.CaptureBodyLimit - captured.Len(); remaining > 0 {
+				captured.Write(chunk[:min(remaining, len(chunk))])
+				if len(chunk) > remaining {
+					captured.WriteString(store.CaptureTruncationMarker)
+				}
+			} else if captured.Len() == store.CaptureBodyLimit {
+				captured.WriteString(store.CaptureTruncationMarker)
+			}
 			if _, err := w.Write(chunk); err != nil {
 				return resp.StatusCode, resp.Header, captured.Bytes(), err
 			}

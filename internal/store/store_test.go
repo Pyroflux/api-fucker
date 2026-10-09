@@ -406,7 +406,7 @@ func TestMetricsAggregateAndTrackFirstByte(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 5, 18, 10, 30, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Minute).Add(-time.Minute)
 	first := int64(120)
 	second := int64(240)
 	if err := st.RecordMetric(key.ID, MetricSample{Time: now, FirstByteMS: &first, Concurrency: 2}); err != nil {
@@ -502,7 +502,7 @@ func TestRecordMetricAggregatesQueueDepth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 5, 18, 10, 30, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Minute).Add(-time.Minute)
 	if err := st.RecordMetric(key.ID, MetricSample{Time: now, QueueDepth: 3}); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestListMetricsHonoursExplicitRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	base := time.Now().UTC().Truncate(time.Minute)
 	for _, offset := range []time.Duration{-3 * time.Hour, -90 * time.Minute, -10 * time.Minute, -30 * time.Second} {
 		if err := st.RecordMetric(key.ID, MetricSample{Time: base.Add(offset), Concurrency: 1}); err != nil {
 			t.Fatal(err)
@@ -787,11 +787,12 @@ func TestManualPausePreservedAcrossResultsAndEdits(t *testing.T) {
 }
 
 func TestBulkPauseAtProductionKeyCount(t *testing.T) {
-	st, err := Open(t.TempDir() + "/data.db")
+	path := t.TempDir() + "/data.db"
+	st, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	ids := make([]string, 1067)
 	if err := st.db.Update(func(tx *bolt.Tx) error {
 		for i := 0; i < 7300; i++ {
@@ -813,6 +814,13 @@ func TestBulkPauseAtProductionKeyCount(t *testing.T) {
 		}
 		return nil
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()

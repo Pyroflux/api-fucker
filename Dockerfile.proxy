@@ -1,0 +1,31 @@
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+
+WORKDIR /src
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+COPY go.mod go.sum ./
+COPY cmd/proxy-client/ ./cmd/proxy-client/
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+    -trimpath -ldflags="-s -w" -o /out/proxy-client ./cmd/proxy-client
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S -g 10001 app && \
+    adduser -S -u 10001 -G app app && \
+    mkdir -p /data && \
+    chown app:app /data
+
+WORKDIR /app
+COPY --from=builder /out/proxy-client /app/proxy-client
+
+ENV LISTEN_ADDR=:9070 \
+    NODE_ID_FILE=/data/proxy-node-id \
+    REPORT_INTERVAL=10s \
+    MAX_CONCURRENCY=100
+
+EXPOSE 9070
+VOLUME ["/data"]
+USER app
+ENTRYPOINT ["/app/proxy-client"]

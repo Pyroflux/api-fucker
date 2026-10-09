@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"api-fucker/internal/admin"
@@ -26,7 +29,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 
 	proxyNodeToken := os.Getenv("PROXY_NODE_TOKEN")
 	gw := gateway.New(st, &http.Client{Timeout: 0}, proxyNodeToken)
@@ -57,7 +59,35 @@ func main() {
 	errCh := make(chan error, 2)
 	go serve("request api", apiSrv, errCh)
 	go serve("admin", adminSrv, errCh)
-	log.Fatal(<-errCh)
+	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	exitCode := 0
+	select {
+	case err := <-errCh:
+		exitCode = 1
+		log.Printf("server stopped: %v", err)
+	case <-stop.Done():
+		log.Print("shutting down")
+	}
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	stopped := make(chan struct{}, 2)
+	for _, srv := range []*http.Server{apiSrv, adminSrv} {
+		go func(srv *http.Server) {
+			if err := srv.Shutdown(ctx); err != nil {
+				_ = srv.Close()
+			}
+			stopped <- struct{}{}
+		}(srv)
+	}
+	<-stopped
+	<-stopped
+	if err := st.CloseContext(ctx); err != nil {
+		log.Printf("shutdown persistence: %v", err)
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
 func newAPIMux(gatewayHandler http.Handler) *http.ServeMux {

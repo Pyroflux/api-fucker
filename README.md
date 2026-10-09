@@ -191,9 +191,21 @@ The admin console records the latest request details for each key:
 - Upstream or transport error text.
 - Network timeline with millisecond offsets.
 
-Image responses are returned to clients in full. To prevent Base64 image data from rapidly growing the database, the response body stored in the latest capture is limited to 64 KiB and includes the original byte count when truncated.
+Requests and responses are forwarded in full. Diagnostic body copies retain up to 64 KiB plus a truncation marker, including streamed responses. Captures have a 1 MiB serialized size ceiling and the detail view shows when content was truncated.
 
 Timeline events distinguish direct and proxied requests, including DNS resolution, proxy connection, CONNECT tunnel establishment, upstream TLS handshake, request send, first byte, response read, retry, and failure steps.
+
+### Runtime state and persistence
+
+Routing, Key health, heartbeat timestamps, and minute counters are updated in memory. The forwarding path and heartbeat handler do not wait for database writes. A single background writer saves merged metadata every second; manual configuration, pause, restore, and deletion operations return success only after their metadata is saved. Persistence failures leave the latest metadata pending for retry.
+
+Diagnostic captures are best effort: the combined pending and in-flight queue is bounded to 128 records / 64 MiB, with up to 4 MiB written per batch. New captures replace older pending captures for the same Key; overflow drops the oldest pending captures. Response-code summaries and counters remain available even when diagnostics are dropped. The proxy management page displays pending counts, queued bytes, dropped captures, and the last persistence result; the same data is included as `persistence` in `GET /api/admin/proxies`.
+
+Minute metrics retain seven days. Expired entries are cleaned at most once per minute. Startup loads metadata and small response-code summaries, without scanning capture bodies. After a restart, proxy nodes require a fresh heartbeat before becoming eligible for routing. The heartbeat interval (10 seconds), client timeout (10 seconds), and offline threshold (30 seconds) are unchanged.
+
+SIGTERM / Ctrl-C allows up to five seconds for shutdown and a best-effort final flush. A crash, forced kill, or disk failure can lose unflushed automatic Key states (including 429 cooldown), recent statistics, node reports, and diagnostics. Manual changes that returned success remain durable. If a manual save fails, its in-memory change is retained and retried; the UI must not treat that failure as confirmed persistence.
+
+Proxy containers log report failures with elapsed time to stderr, limit repeated failure logs to once per minute, and log recovery. View them with `docker logs --tail 100 api-fucker-proxy`. In the admin proxy table, expand an error to see the complete text or copy it.
 
 ### HTTP 429 Cooldown
 
@@ -237,19 +249,49 @@ Defaults:
 - `REPORT_INTERVAL=10s`
 - `MAX_CONCURRENCY=100`
 
-Docker client example:
+The standalone proxy image is `pyroflux/proxy:latest` (`linux/amd64`). It starts
+the proxy directly and takes all configuration from environment variables.
+
+| Variable | Default / requirement |
+| --- | --- |
+| `SERVER_URL` | Required: main service admin base URL, for example `http://MAIN_SERVER_IP:8081`. |
+| `PROXY_NODE_TOKEN` | Required: shared token matching the main service. |
+| `LISTEN_ADDR` | `:9070`; change the container port mapping too if this changes. |
+| `NODE_ID` | Optional explicit node ID; use a different ID for each node. Otherwise generated and saved to `NODE_ID_FILE`. |
+| `NODE_NAME` | Container hostname; set explicitly for a recognizable, stable name. |
+| `NODE_ID_FILE` | `/data/proxy-node-id` in the image. Mount `/data` to retain the generated ID across container recreation. |
+| `PUBLIC_PROXY_URL` | Optional address reachable from the main service. Defaults to the reporting IP plus listen port. Set explicitly for NAT or different published ports. |
+| `REPORT_INTERVAL` | `10s`; positive Go duration, such as `30s`. |
+| `MAX_CONCURRENCY` | `100`; positive concurrency capacity reported to the main service for scheduling, not a local hard connection limit. |
+
+Docker client example (replace the address and token):
 
 ```bash
 docker run -d \
   --name api-fucker-proxy \
+  --restart unless-stopped \
   -p 9070:9070 \
+  -v api-fucker-proxy-data:/data \
   -e SERVER_URL=http://MAIN_SERVER_IP:8081 \
   -e PROXY_NODE_TOKEN=proxy-node-secret \
-  pyroflux/api-fucker:latest \
-  /app/proxy-client
+  -e NODE_NAME=vps-proxy-1 \
+  pyroflux/proxy:latest
 ```
 
-If the VPS is behind NAT, has multiple public IPs, or uses port mapping, set `PUBLIC_PROXY_URL` explicitly, for example `http://203.0.113.10:9070`.
+You can also pass these variables with `--env-file /path/to/proxy.env` instead of
+individual `-e` arguments. Create that file yourself; no configuration or token
+is baked into the image. Each node needs its own data volume or explicit `NODE_ID`.
+
+If the VPS is behind NAT, has multiple public IPs, or uses port mapping, set
+`PUBLIC_PROXY_URL` explicitly, for example `http://203.0.113.10:19070` when using
+`-p 19070:9070`. The proxy exposes `GET /healthz` on its listen port.
+
+Build and publish the proxy image independently of the gateway:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.proxy --load -t pyroflux/proxy:latest .
+docker push pyroflux/proxy:latest
+```
 
 ### Batch deploy with systemd
 

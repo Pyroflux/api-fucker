@@ -1,0 +1,6 @@
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/proxy-client/
+!cmd/proxy-client/*.go

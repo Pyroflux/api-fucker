@@ -38,6 +38,7 @@ var (
 
 type Store struct {
 	db *bolt.DB
+	*runtimeState
 }
 
 type GlobalConfig struct {
@@ -185,6 +186,8 @@ type MetricPoint struct {
 }
 
 type Capture struct {
+	revision       uint64
+	generation     uint64
 	KeyID          string                `json:"keyId"`
 	Time           time.Time             `json:"time"`
 	DurationMS     int64                 `json:"durationMs"`
@@ -197,6 +200,7 @@ type Capture struct {
 	ResponseBody   string                `json:"responseBody"`
 	Error          string                `json:"error"`
 	NetworkEvents  []CaptureNetworkEvent `json:"networkEvents,omitempty"`
+	Truncated      bool                  `json:"truncated,omitempty"`
 }
 
 type CaptureNetworkEvent struct {
@@ -218,11 +222,16 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := st.loadRuntime(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	go st.persistenceLoop()
 	return st, nil
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	return s.closeRuntime()
 }
 
 func (s *Store) init() error {
@@ -259,18 +268,9 @@ func (s *Store) init() error {
 }
 
 func (s *Store) GlobalConfig() (GlobalConfig, error) {
-	var cfg GlobalConfig
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket([]byte(metaBucket)).Get([]byte(globalConfigID))
-		if raw == nil {
-			return ErrNotFound
-		}
-		return json.Unmarshal(raw, &cfg)
-	})
-	if err == nil {
-		cfg = normalizeGlobalConfig(cfg)
-	}
-	return cfg, err
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneConfig(s.config), nil
 }
 
 func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
@@ -306,13 +306,15 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 	cfg.IPAllowlist = normalizeRules(cfg.IPAllowlist)
 	cfg.IPBlocklist = normalizeRules(cfg.IPBlocklist)
 	cfg.UpdatedAt = time.Now().UTC()
-	return s.db.Update(func(tx *bolt.Tx) error {
-		raw, err := json.Marshal(cfg)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket([]byte(metaBucket)).Put([]byte(globalConfigID), raw)
-	})
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	s.config = cloneConfig(cfg)
+	s.dirtyConfig = s.nextRevisionLocked()
+	s.mu.Unlock()
+	return s.Flush()
 }
 
 func normalizeProxyMode(mode string) string {
@@ -364,38 +366,23 @@ func normalizeRules(values []string) []string {
 }
 
 func (s *Store) ListKeys() ([]Key, error) {
-	keys := make([]Key, 0)
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte(keysBucket)).ForEach(func(_, v []byte) error {
-			var key Key
-			if err := json.Unmarshal(v, &key); err != nil {
-				return err
-			}
-			// Never parse captures here: both admin lists and request routing use ListKeys.
-			// Legacy captures acquire a summary on their next SaveCapture, without a full scan.
-			key.LastStatusCode = 0
-			if raw := tx.Bucket([]byte(captureStatusBucket)).Get([]byte(key.ID)); raw != nil {
-				if err := json.Unmarshal(raw, &key.LastStatusCode); err != nil {
-					return err
-				}
-			}
-			keys = append(keys, key)
-			return nil
-		})
-	})
-	return keys, err
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]Key, 0, len(s.keys))
+	for _, id := range s.keyOrder {
+		keys = append(keys, cloneKey(s.keys[id]))
+	}
+	return keys, nil
 }
 
 func (s *Store) GetKey(id string) (Key, error) {
-	var key Key
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket([]byte(keysBucket)).Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		return json.Unmarshal(raw, &key)
-	})
-	return key, err
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.keys[id]
+	if !ok {
+		return Key{}, ErrNotFound
+	}
+	return cloneKey(key), nil
 }
 
 func (s *Store) CreateKey(key Key) (Key, error) {
@@ -408,197 +395,103 @@ func (s *Store) CreateKey(key Key) (Key, error) {
 	if key.MaxConcurrency <= 0 {
 		key.MaxConcurrency = 1
 	}
-	if !key.Enabled {
-		key.Enabled = true
-	}
+	key.Enabled = true
 	if err := ValidateKey(key); err != nil {
 		return Key{}, err
 	}
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		if b.Get([]byte(key.ID)) != nil {
-			return fmt.Errorf("key id already exists")
-		}
-		raw, err := json.Marshal(key)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(key.ID), raw)
-	})
-	return key, err
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return Key{}, ErrClosed
+	}
+	if _, exists := s.keys[key.ID]; exists {
+		s.mu.Unlock()
+		return Key{}, fmt.Errorf("key id already exists")
+	}
+	s.keys[key.ID] = cloneKey(key)
+	s.dirtyKeys[key.ID] = s.nextRevisionLocked()
+	s.keyGeneration[key.ID] = s.revision
+	s.ignoreStoredCapture[key.ID] = true
+	s.dirtyCaptureDeletes[key.ID] = s.revision
+	order := make([]string, len(s.keyOrder)+1)
+	idx := sort.SearchStrings(s.keyOrder, key.ID)
+	copy(order, s.keyOrder[:idx])
+	order[idx] = key.ID
+	copy(order[idx+1:], s.keyOrder[idx:])
+	s.keyOrder = order
+	s.mu.Unlock()
+	return key, s.Flush()
 }
 
 func (s *Store) UpdateKey(id string, patch Key) (Key, error) {
-	var updated Key
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		if err := json.Unmarshal(raw, &updated); err != nil {
-			return err
-		}
-		updated.Name = patch.Name
-		updated.APIKey = patch.APIKey
-		updated.BaseURL = patch.BaseURL
-		updated.ProxyURL = patch.ProxyURL
-		updated.MaxConcurrency = patch.MaxConcurrency
-		updated.Enabled = patch.Enabled
-		updated.Paused = patch.Paused
-		updated.BalanceDepleted = patch.BalanceDepleted
-		updated.UpdatedAt = time.Now().UTC()
-		if updated.MaxConcurrency <= 0 {
-			updated.MaxConcurrency = 1
-		}
-		if err := ValidateKey(updated); err != nil {
-			return err
-		}
-		next, err := json.Marshal(updated)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(id), next)
+	if patch.MaxConcurrency <= 0 {
+		patch.MaxConcurrency = 1
+	}
+	if err := ValidateKey(patch); err != nil {
+		return Key{}, err
+	}
+	key, err := s.mutateKey(id, func(key *Key) {
+		key.Name = patch.Name
+		key.APIKey = patch.APIKey
+		key.BaseURL = patch.BaseURL
+		key.ProxyURL = patch.ProxyURL
+		key.MaxConcurrency = patch.MaxConcurrency
+		key.Enabled = patch.Enabled
+		key.Paused = patch.Paused
+		key.BalanceDepleted = patch.BalanceDepleted
 	})
-	return updated, err
+	if err != nil {
+		return key, err
+	}
+	return key, s.Flush()
 }
 
 func (s *Store) UpdateKeysMaxConcurrency(ids []string, maxConcurrency int) (BulkUpdateResult, error) {
 	if maxConcurrency <= 0 {
 		return BulkUpdateResult{}, fmt.Errorf("max concurrency must be greater than zero")
 	}
-	wanted := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id != "" {
-			wanted[id] = true
-		}
-	}
-	updateAll := len(wanted) == 0
-	result := BulkUpdateResult{}
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		type keyUpdate struct {
-			id  []byte
-			key Key
-		}
-		updates := make([]keyUpdate, 0)
-		if err := b.ForEach(func(k, v []byte) error {
-			id := string(k)
-			if !updateAll && !wanted[id] {
-				return nil
-			}
-			var key Key
-			if err := json.Unmarshal(v, &key); err != nil {
-				return err
-			}
-			key.MaxConcurrency = maxConcurrency
-			key.UpdatedAt = time.Now().UTC()
-			if err := ValidateKey(key); err != nil {
-				return err
-			}
-			updates = append(updates, keyUpdate{id: append([]byte(nil), k...), key: key})
-			return nil
-		}); err != nil {
-			return err
-		}
-		for _, update := range updates {
-			raw, err := json.Marshal(update.key)
-			if err != nil {
-				return err
-			}
-			if err := b.Put(update.id, raw); err != nil {
-				return err
-			}
-			result.Updated++
-		}
-		return nil
-	})
-	return result, err
+	count, err := s.changeKeys(ids, func(key *Key) bool { key.MaxConcurrency = maxConcurrency; return true })
+	return BulkUpdateResult{Updated: count}, err
 }
 
-// PauseKeys updates only key metadata; it never reads request captures.
-// A nil/empty ID list means all keys, matching the other bulk store operations.
 func (s *Store) PauseKeys(ids []string) (BulkUpdateResult, error) {
-	result := BulkUpdateResult{}
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		targets := make(map[string]struct{}, len(ids))
-		if len(ids) == 0 {
-			if err := b.ForEach(func(id, _ []byte) error { targets[string(id)] = struct{}{}; return nil }); err != nil {
-				return err
-			}
-		} else {
-			for _, id := range ids {
-				targets[id] = struct{}{}
-			}
+	count, err := s.changeKeys(ids, func(key *Key) bool {
+		if key.ManualPaused {
+			return false
 		}
-		for id := range targets {
-			raw := b.Get([]byte(id))
-			if raw == nil {
-				continue
-			}
-			var key Key
-			if err := json.Unmarshal(raw, &key); err != nil {
-				return err
-			}
-			if key.ManualPaused {
-				continue
-			}
-			key.ManualPaused = true
-			key.UpdatedAt = time.Now().UTC()
-			raw, err := json.Marshal(key)
-			if err != nil {
-				return err
-			}
-			if err := b.Put([]byte(id), raw); err != nil {
-				return err
-			}
-			result.Updated++
-		}
-		return nil
+		key.ManualPaused = true
+		return true
 	})
-	return result, err
+	return BulkUpdateResult{Updated: count}, err
 }
 
 func (s *Store) DeleteKeys(ids []string) (BulkDeleteResult, error) {
-	wanted := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id != "" {
-			wanted[id] = true
-		}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return BulkDeleteResult{}, ErrClosed
 	}
-	deleteAll := len(wanted) == 0
+	wanted := idSet(ids)
+	all := len(wanted) == 0
 	result := BulkDeleteResult{}
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		keys := tx.Bucket([]byte(keysBucket))
-		captures := tx.Bucket([]byte(captureBucket))
-		toDelete := make([][]byte, 0)
-		if err := keys.ForEach(func(k, _ []byte) error {
-			id := string(k)
-			if deleteAll || wanted[id] {
-				toDelete = append(toDelete, append([]byte(nil), k...))
-			}
-			return nil
-		}); err != nil {
-			return err
+	order := make([]string, 0, len(s.keyOrder))
+	for _, id := range s.keyOrder {
+		if !all && !wanted[id] {
+			order = append(order, id)
+			continue
 		}
-		for _, id := range toDelete {
-			if err := keys.Delete(id); err != nil {
-				return err
-			}
-			if err := captures.Delete(id); err != nil {
-				return err
-			}
-			if err := tx.Bucket([]byte(captureStatusBucket)).Delete(id); err != nil {
-				return err
-			}
-			result.Deleted++
-		}
-		return nil
-	})
-	return result, err
+		delete(s.keys, id)
+		delete(s.keyGeneration, id)
+		delete(s.latestCaptureSequence, id)
+		delete(s.ignoreStoredCapture, id)
+		s.dirtyKeys[id] = s.nextRevisionLocked()
+		s.dirtyCaptureDeletes[id] = s.revision
+		s.dropPendingCaptureLocked(id, false)
+		result.Deleted++
+	}
+	s.keyOrder = order
+	s.mu.Unlock()
+	return result, s.Flush()
 }
 
 func (s *Store) ImportKeys(inputs []ImportKeyInput) (ImportResult, error) {
@@ -652,19 +545,15 @@ func (s *Store) ImportKeys(inputs []ImportKeyInput) (ImportResult, error) {
 }
 
 func (s *Store) DeleteKey(id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket([]byte(keysBucket)).Delete([]byte(id)); err != nil {
-			return err
-		}
-		if err := tx.Bucket([]byte(captureBucket)).Delete([]byte(id)); err != nil {
-			return err
-		}
-		return tx.Bucket([]byte(captureStatusBucket)).Delete([]byte(id))
-	})
+	if strings.TrimSpace(id) == "" {
+		return ErrNotFound
+	}
+	_, err := s.DeleteKeys([]string{id})
+	return err
 }
 
 func (s *Store) RestoreKey(id string) (Key, error) {
-	return s.mutateKey(id, func(key *Key) {
+	key, err := s.mutateKey(id, func(key *Key) {
 		key.Paused = false
 		key.Consecutive429 = 0
 		key.RateLimitedUntil = time.Time{}
@@ -673,40 +562,26 @@ func (s *Store) RestoreKey(id string) (Key, error) {
 		key.ConsecutiveErrors = 0
 		key.LastError = ""
 	})
+	if err != nil {
+		return key, err
+	}
+	return key, s.Flush()
 }
 
 func (s *Store) RestoreAllKeys() (int, error) {
-	restored := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		return b.ForEach(func(id, raw []byte) error {
-			var key Key
-			if err := json.Unmarshal(raw, &key); err != nil {
-				return err
-			}
-			if !key.ManualPaused && !key.Paused && !key.BalanceDepleted && key.Consecutive429 == 0 && key.RateLimitedUntil.IsZero() && key.ConsecutiveErrors == 0 && key.LastError == "" {
-				return nil
-			}
-			key.Consecutive429 = 0
-			key.RateLimitedUntil = time.Time{}
-			key.ManualPaused = false
-			key.Paused = false
-			key.BalanceDepleted = false
-			key.ConsecutiveErrors = 0
-			key.LastError = ""
-			key.UpdatedAt = time.Now().UTC()
-			next, err := json.Marshal(key)
-			if err != nil {
-				return err
-			}
-			if err := b.Put(id, next); err != nil {
-				return err
-			}
-			restored++
-			return nil
-		})
+	return s.changeKeys(nil, func(key *Key) bool {
+		if !key.ManualPaused && !key.Paused && !key.BalanceDepleted && key.Consecutive429 == 0 && key.RateLimitedUntil.IsZero() && key.ConsecutiveErrors == 0 && key.LastError == "" {
+			return false
+		}
+		key.Consecutive429 = 0
+		key.RateLimitedUntil = time.Time{}
+		key.ManualPaused = false
+		key.Paused = false
+		key.BalanceDepleted = false
+		key.ConsecutiveErrors = 0
+		key.LastError = ""
+		return true
 	})
-	return restored, err
 }
 
 func (s *Store) RecordSuccess(id string, responseMS ...int64) error {
@@ -788,69 +663,53 @@ func (s *Store) recordRateLimitAt(id, message string, responseMS int64, cfg Glob
 	}, 429)
 }
 
-func (s *Store) SaveCapture(c Capture) error {
-	c.Time = c.Time.UTC()
-	return s.db.Update(func(tx *bolt.Tx) error {
-		raw, err := json.Marshal(c)
-		if err != nil {
-			return err
-		}
-		if err := tx.Bucket([]byte(captureBucket)).Put([]byte(c.KeyID), raw); err != nil {
-			return err
-		}
-		status, err := json.Marshal(c.StatusCode)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket([]byte(captureStatusBucket)).Put([]byte(c.KeyID), status)
-	})
-}
+func (s *Store) SaveCapture(c Capture) error { return s.enqueueCapture(c) }
 
 func (s *Store) RecordMetric(keyID string, sample MetricSample) error {
-	now := sample.Time.UTC()
-	if now.IsZero() {
-		now = time.Now().UTC()
+	now := time.Now().UTC()
+	at := sample.Time.UTC()
+	if at.IsZero() {
+		at = now
 	}
-	bucketTime := now.Truncate(time.Minute)
-	return s.db.Update(func(tx *bolt.Tx) error {
-		metrics := tx.Bucket([]byte(metricsBucket))
-		if err := deleteOldMetrics(metrics, now.Add(-metricsMaxAge)); err != nil {
-			return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	s.pruneMetricsLocked(now)
+	if at.Before(now.Add(-metricsMaxAge)) || at.After(now.Add(time.Minute)) {
+		return nil
+	}
+	bucketTime := at.Truncate(time.Minute)
+	id := string(metricBucketKey(bucketTime))
+	record := s.metrics[id]
+	record.Time = bucketTime
+	record.Requests++
+	if sample.FirstByteMS != nil {
+		record.FirstByteTotalMS += *sample.FirstByteMS
+		record.FirstByteSamples++
+	}
+	if sample.Concurrency > record.MaxConcurrency {
+		record.MaxConcurrency = sample.Concurrency
+	}
+	if sample.QueueDepth > record.MaxQueueDepth {
+		record.MaxQueueDepth = sample.QueueDepth
+	}
+	if sample.Error {
+		record.Errors++
+	}
+	s.metrics[id] = record
+	s.dirtyMetrics[id] = s.nextRevisionLocked()
+	if sample.FirstByteMS != nil {
+		if key, ok := s.keys[keyID]; ok {
+			value := *sample.FirstByteMS
+			key.LastFirstByteMS = &value
+			key.UpdatedAt = now
+			s.keys[keyID] = key
+			s.dirtyKeys[keyID] = s.nextRevisionLocked()
 		}
-
-		record := metricBucketRecord{Time: bucketTime}
-		metricKey := metricBucketKey(bucketTime)
-		if raw := metrics.Get(metricKey); raw != nil {
-			if err := json.Unmarshal(raw, &record); err != nil {
-				return err
-			}
-		}
-		record.Requests++
-		if sample.FirstByteMS != nil {
-			record.FirstByteTotalMS += *sample.FirstByteMS
-			record.FirstByteSamples++
-		}
-		if sample.Concurrency > record.MaxConcurrency {
-			record.MaxConcurrency = sample.Concurrency
-		}
-		if sample.QueueDepth > record.MaxQueueDepth {
-			record.MaxQueueDepth = sample.QueueDepth
-		}
-		if sample.Error {
-			record.Errors++
-		}
-		raw, err := json.Marshal(record)
-		if err != nil {
-			return err
-		}
-		if err := metrics.Put(metricKey, raw); err != nil {
-			return err
-		}
-		if sample.FirstByteMS == nil || strings.TrimSpace(keyID) == "" {
-			return nil
-		}
-		return updateKeyFirstByte(tx, keyID, *sample.FirstByteMS, now)
-	})
+	}
+	return nil
 }
 
 func (s *Store) ListMetrics(granularity string, from, to time.Time) ([]MetricPoint, error) {
@@ -868,39 +727,34 @@ func (s *Store) ListMetrics(granularity string, from, to time.Time) ([]MetricPoi
 	}
 	truncate := metricTruncator(granularity)
 	aggregated := make(map[int64]metricBucketRecord)
-	err := s.db.View(func(tx *bolt.Tx) error {
-		metrics := tx.Bucket([]byte(metricsBucket))
-		return metrics.ForEach(func(_, raw []byte) error {
-			var record metricBucketRecord
-			if err := json.Unmarshal(raw, &record); err != nil {
-				return err
-			}
-			record.Time = record.Time.UTC()
-			if record.Time.Before(from) || record.Time.After(to) {
-				return nil
-			}
-			pointTime := truncate(record.Time)
-			key := pointTime.Unix()
-			next := aggregated[key]
-			if next.Time.IsZero() {
-				next.Time = pointTime
-			}
-			next.Requests += record.Requests
-			next.FirstByteTotalMS += record.FirstByteTotalMS
-			next.FirstByteSamples += record.FirstByteSamples
-			if record.MaxConcurrency > next.MaxConcurrency {
-				next.MaxConcurrency = record.MaxConcurrency
-			}
-			if record.MaxQueueDepth > next.MaxQueueDepth {
-				next.MaxQueueDepth = record.MaxQueueDepth
-			}
-			next.Errors += record.Errors
-			aggregated[key] = next
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
+	s.mu.RLock()
+	records := make([]metricBucketRecord, 0, len(s.metrics))
+	for _, record := range s.metrics {
+		records = append(records, record)
+	}
+	s.mu.RUnlock()
+	for _, record := range records {
+		record.Time = record.Time.UTC()
+		if record.Time.Before(from) || record.Time.After(to) {
+			continue
+		}
+		pointTime := truncate(record.Time)
+		key := pointTime.Unix()
+		next := aggregated[key]
+		if next.Time.IsZero() {
+			next.Time = pointTime
+		}
+		next.Requests += record.Requests
+		next.FirstByteTotalMS += record.FirstByteTotalMS
+		next.FirstByteSamples += record.FirstByteSamples
+		if record.MaxConcurrency > next.MaxConcurrency {
+			next.MaxConcurrency = record.MaxConcurrency
+		}
+		if record.MaxQueueDepth > next.MaxQueueDepth {
+			next.MaxQueueDepth = record.MaxQueueDepth
+		}
+		next.Errors += record.Errors
+		aggregated[key] = next
 	}
 	points := make([]MetricPoint, 0, len(aggregated))
 	for _, record := range aggregated {
@@ -925,7 +779,28 @@ func (s *Store) ListMetrics(granularity string, from, to time.Time) ([]MetricPoi
 }
 
 func (s *Store) GetCapture(keyID string) (Capture, error) {
+	s.mu.RLock()
+	if _, ok := s.keys[keyID]; !ok {
+		s.mu.RUnlock()
+		return Capture{}, ErrNotFound
+	}
+	pending := s.pendingCaptures[keyID]
+	if pending == nil {
+		pending = s.flushingCaptures[keyID]
+	}
+	if pending != nil && pending.generation != s.keyGeneration[keyID] {
+		pending = nil
+	}
+	ignore := s.ignoreStoredCapture[keyID]
+	s.mu.RUnlock()
 	var c Capture
+	if pending != nil {
+		err := json.Unmarshal(pending.raw, &c)
+		return c, err
+	}
+	if ignore {
+		return c, ErrNotFound
+	}
 	err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket([]byte(captureBucket)).Get([]byte(keyID))
 		if raw == nil {
@@ -940,33 +815,24 @@ func (s *Store) ListProxyNodes(now time.Time) ([]ProxyNodeView, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	nodes := make([]ProxyNodeView, 0)
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte(proxyNodesBucket)).ForEach(func(_, raw []byte) error {
-			var node ProxyNode
-			if err := json.Unmarshal(raw, &node); err != nil {
-				return err
-			}
-			nodes = append(nodes, proxyNodeView(node, now))
-			return nil
-		})
-	})
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].ID < nodes[j].ID
-	})
-	return nodes, err
+	s.mu.RLock()
+	nodes := make([]ProxyNodeView, 0, len(s.proxies))
+	for _, node := range s.proxies {
+		nodes = append(nodes, proxyNodeView(node, now))
+	}
+	s.mu.RUnlock()
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return nodes, nil
 }
 
 func (s *Store) GetProxyNode(id string) (ProxyNode, error) {
-	var node ProxyNode
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket([]byte(proxyNodesBucket)).Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		return json.Unmarshal(raw, &node)
-	})
-	return node, err
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	node, ok := s.proxies[id]
+	if !ok {
+		return ProxyNode{}, ErrNotFound
+	}
+	return node, nil
 }
 
 func (s *Store) UpsertProxyNodeReport(report ProxyNodeReport, remoteAddr string) (ProxyNode, error) {
@@ -975,100 +841,93 @@ func (s *Store) UpsertProxyNodeReport(report ProxyNodeReport, remoteAddr string)
 		return ProxyNode{}, fmt.Errorf("proxy node id is required")
 	}
 	now := time.Now().UTC()
-	var node ProxyNode
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(proxyNodesBucket))
-		raw := b.Get([]byte(report.ID))
-		if raw == nil {
-			node = ProxyNode{
-				ID:             report.ID,
-				Name:           strings.TrimSpace(report.Name),
-				Enabled:        true,
-				MaxConcurrency: 100,
-				CreatedAt:      now,
-			}
-			if node.Name == "" {
-				node.Name = node.ID
-			}
-			if report.MaxConcurrency > 0 {
-				node.MaxConcurrency = report.MaxConcurrency
-			}
-		} else if err := json.Unmarshal(raw, &node); err != nil {
-			return err
-		}
-
-		if name := strings.TrimSpace(report.Name); name != "" {
-			node.Name = name
-		}
-		node.ProxyURL = strings.TrimSpace(report.ProxyURL)
-		if node.ProxyURL == "" {
-			node.ProxyURL = deriveProxyURL(remoteAddr, report.ListenAddr)
-		}
-		node.ListenAddr = strings.TrimSpace(report.ListenAddr)
-		node.Version = strings.TrimSpace(report.Version)
-		node.StartedAt = report.StartedAt.UTC()
-		node.LastReportAt = now
-		node.LastRemoteAddr = remoteHost(remoteAddr)
-		node.CurrentConnections = nonNegativeInt(report.CurrentConnections)
-		node.TotalRequests = nonNegativeInt64(report.TotalRequests)
-		node.FailedRequests = nonNegativeInt64(report.FailedRequests)
-		node.BytesIn = nonNegativeInt64(report.BytesIn)
-		node.BytesOut = nonNegativeInt64(report.BytesOut)
-		node.LastError = strings.TrimSpace(report.LastError)
-		node.UpdatedAt = now
-		if node.MaxConcurrency <= 0 {
-			node.MaxConcurrency = 100
-		}
-		if err := ValidateProxyNode(node); err != nil {
-			return err
-		}
-		next, err := json.Marshal(node)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(node.ID), next)
-	})
-	return node, err
-}
-
-func (s *Store) UpdateProxyNode(id string, patch ProxyNode) (ProxyNode, error) {
-	var node ProxyNode
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(proxyNodesBucket))
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		if err := json.Unmarshal(raw, &node); err != nil {
-			return err
-		}
-		node.Name = strings.TrimSpace(patch.Name)
-		node.ProxyURL = strings.TrimSpace(patch.ProxyURL)
-		node.Enabled = patch.Enabled
-		node.MaxConcurrency = patch.MaxConcurrency
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ProxyNode{}, ErrClosed
+	}
+	node, exists := s.proxies[report.ID]
+	if !exists {
+		node = ProxyNode{ID: report.ID, Name: strings.TrimSpace(report.Name), Enabled: true, MaxConcurrency: 100, CreatedAt: now}
 		if node.Name == "" {
 			node.Name = node.ID
 		}
-		if node.MaxConcurrency <= 0 {
-			node.MaxConcurrency = 100
+		if report.MaxConcurrency > 0 {
+			node.MaxConcurrency = report.MaxConcurrency
 		}
-		node.UpdatedAt = time.Now().UTC()
-		if err := ValidateProxyNode(node); err != nil {
-			return err
-		}
-		next, err := json.Marshal(node)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(id), next)
-	})
-	return node, err
+	}
+	if name := strings.TrimSpace(report.Name); name != "" {
+		node.Name = name
+	}
+	node.ProxyURL = strings.TrimSpace(report.ProxyURL)
+	if node.ProxyURL == "" {
+		node.ProxyURL = deriveProxyURL(remoteAddr, report.ListenAddr)
+	}
+	node.ListenAddr = strings.TrimSpace(report.ListenAddr)
+	node.Version = strings.TrimSpace(report.Version)
+	node.StartedAt = report.StartedAt.UTC()
+	node.LastReportAt = now
+	node.LastRemoteAddr = remoteHost(remoteAddr)
+	node.CurrentConnections = nonNegativeInt(report.CurrentConnections)
+	node.TotalRequests = nonNegativeInt64(report.TotalRequests)
+	node.FailedRequests = nonNegativeInt64(report.FailedRequests)
+	node.BytesIn = nonNegativeInt64(report.BytesIn)
+	node.BytesOut = nonNegativeInt64(report.BytesOut)
+	node.LastError = strings.TrimSpace(report.LastError)
+	node.UpdatedAt = now
+	if node.MaxConcurrency <= 0 {
+		node.MaxConcurrency = 100
+	}
+	if err := ValidateProxyNode(node); err != nil {
+		return ProxyNode{}, err
+	}
+	s.proxies[report.ID] = node
+	s.dirtyProxies[report.ID] = s.nextRevisionLocked()
+	return node, nil
+}
+
+func (s *Store) UpdateProxyNode(id string, patch ProxyNode) (ProxyNode, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ProxyNode{}, ErrClosed
+	}
+	node, ok := s.proxies[id]
+	if !ok {
+		s.mu.Unlock()
+		return ProxyNode{}, ErrNotFound
+	}
+	node.Name = strings.TrimSpace(patch.Name)
+	node.ProxyURL = strings.TrimSpace(patch.ProxyURL)
+	node.Enabled = patch.Enabled
+	node.MaxConcurrency = patch.MaxConcurrency
+	if node.Name == "" {
+		node.Name = node.ID
+	}
+	if node.MaxConcurrency <= 0 {
+		node.MaxConcurrency = 100
+	}
+	node.UpdatedAt = time.Now().UTC()
+	if err := ValidateProxyNode(node); err != nil {
+		s.mu.Unlock()
+		return ProxyNode{}, err
+	}
+	s.proxies[id] = node
+	s.dirtyProxies[id] = s.nextRevisionLocked()
+	s.mu.Unlock()
+	return node, s.Flush()
 }
 
 func (s *Store) DeleteProxyNode(id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte(proxyNodesBucket)).Delete([]byte(id))
-	})
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	delete(s.proxies, id)
+	s.dirtyProxies[id] = s.nextRevisionLocked()
+	s.mu.Unlock()
+	return s.Flush()
 }
 
 func proxyNodeView(node ProxyNode, now time.Time) ProxyNodeView {
@@ -1130,40 +989,19 @@ func nonNegativeInt64(value int64) int64 {
 	return value
 }
 
-func updateKeyFirstByte(tx *bolt.Tx, id string, firstByteMS int64, now time.Time) error {
-	b := tx.Bucket([]byte(keysBucket))
-	raw := b.Get([]byte(id))
-	if raw == nil {
-		return nil
-	}
-	var key Key
-	if err := json.Unmarshal(raw, &key); err != nil {
-		return err
-	}
-	key.LastFirstByteMS = &firstByteMS
-	key.UpdatedAt = now.UTC()
-	next, err := json.Marshal(key)
-	if err != nil {
-		return err
-	}
-	return b.Put([]byte(id), next)
-}
-
 func metricBucketKey(t time.Time) []byte {
 	return []byte(fmt.Sprintf("%020d", t.UTC().Truncate(time.Minute).Unix()))
 }
 
 func deleteOldMetrics(b *bolt.Bucket, cutoff time.Time) error {
-	c := b.Cursor()
-	for k, raw := c.First(); k != nil; k, raw = c.Next() {
-		var record metricBucketRecord
-		if err := json.Unmarshal(raw, &record); err != nil {
-			return err
-		}
-		if !record.Time.Before(cutoff) {
-			continue
-		}
-		if err := c.Delete(); err != nil {
+	cursor := b.Cursor()
+	// Keys are ordered minute timestamps. Retain the boundary minute because
+	// samples later in that minute may still be within the seven-day window.
+	boundary := string(metricBucketKey(cutoff))
+	// Deletion shifts leaf entries; seeking the first remaining key avoids
+	// skipping the adjacent expired entry.
+	for k, _ := cursor.First(); k != nil && string(k) < boundary; k, _ = cursor.First() {
+		if err := cursor.Delete(); err != nil {
 			return err
 		}
 	}
@@ -1184,38 +1022,27 @@ func metricTruncator(granularity string) func(time.Time) time.Time {
 	}
 }
 
-// mutateKey reads and writes state in one transaction so in-flight results
+// mutateKey updates the shared runtime state atomically so in-flight results
 // cannot overwrite a concurrent manual pause or configuration edit.
 func (s *Store) mutateKey(id string, mutate func(*Key), responseStatus ...int) (Key, error) {
-	var key Key
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(keysBucket))
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		if err := json.Unmarshal(raw, &key); err != nil {
-			return err
-		}
-		mutate(&key)
-		key.UpdatedAt = time.Now().UTC()
-		raw, err := json.Marshal(key)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(id), raw); err != nil {
-			return err
-		}
-		if len(responseStatus) > 0 {
-			status, err := json.Marshal(responseStatus[0])
-			if err != nil {
-				return err
-			}
-			return tx.Bucket([]byte(captureStatusBucket)).Put([]byte(id), status)
-		}
-		return nil
-	})
-	return key, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return Key{}, ErrClosed
+	}
+	key, ok := s.keys[id]
+	if !ok {
+		return Key{}, ErrNotFound
+	}
+	key = cloneKey(key)
+	mutate(&key)
+	key.UpdatedAt = time.Now().UTC()
+	if len(responseStatus) > 0 {
+		key.LastStatusCode = responseStatus[0]
+	}
+	s.keys[id] = key
+	s.dirtyKeys[id] = s.nextRevisionLocked()
+	return cloneKey(key), nil
 }
 
 func ValidateKey(key Key) error {

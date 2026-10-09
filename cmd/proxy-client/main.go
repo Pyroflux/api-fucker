@@ -15,9 +15,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -45,8 +45,10 @@ type proxyServer struct {
 	bytesIn  atomic.Int64
 	bytesOut atomic.Int64
 
-	lastMu    sync.Mutex
-	lastError string
+	lastError     atomic.Pointer[string]
+	reportError   atomic.Pointer[string]
+	lastReportLog time.Time
+	reportFailing bool
 }
 
 type reportPayload struct {
@@ -267,6 +269,12 @@ func reportLoop(cfg config, ps *proxyServer, startedAt time.Time) {
 }
 
 func reportOnce(cfg config, ps *proxyServer, startedAt time.Time) {
+	start := time.Now()
+	err := sendReport(cfg, ps, startedAt)
+	ps.recordReportResult(err, time.Since(start), cfg.Token)
+}
+
+func sendReport(cfg config, ps *proxyServer, startedAt time.Time) error {
 	payload := reportPayload{
 		ID:                 cfg.NodeID,
 		Name:               cfg.NodeName,
@@ -284,29 +292,26 @@ func reportOnce(cfg config, ps *proxyServer, startedAt time.Time) {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		ps.setLastError(err)
-		return
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.ServerURL+"/api/admin/proxies/report", strings.NewReader(string(body)))
 	if err != nil {
-		ps.setLastError(err)
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		ps.setLastError(err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		ps.setLastError(fmt.Errorf("report returned %s", resp.Status))
-		return
+		return fmt.Errorf("report returned %s", resp.Status)
 	}
-	ps.setLastError(nil)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	return nil
 }
 
 func (p *proxyServer) recordFailure(err error) {
@@ -314,20 +319,70 @@ func (p *proxyServer) recordFailure(err error) {
 	p.setLastError(err)
 }
 
-func (p *proxyServer) setLastError(err error) {
-	p.lastMu.Lock()
-	defer p.lastMu.Unlock()
+var credentialURL = regexp.MustCompile(`(https?://)[^/\s]*@`)
+
+func safeReportError(err error, token string) string {
 	if err == nil {
-		p.lastError = ""
+		return ""
+	}
+	message := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		target, parseErr := url.Parse(urlErr.URL)
+		if parseErr == nil {
+			target.User = nil
+			target.RawQuery = ""
+			target.Fragment = ""
+			message = fmt.Sprintf("%s %q: %v", urlErr.Op, target.String(), urlErr.Err)
+		}
+	}
+	message = credentialURL.ReplaceAllString(message, "${1}[redacted]@")
+	if token != "" {
+		message = strings.ReplaceAll(message, token, "[redacted]")
+	}
+	if len(message) > 4096 {
+		message = message[:4096]
+	}
+	return message
+}
+
+// Called only by the single report loop; forwarding counters and last error
+// are atomic and do not wait for network reporting or log output.
+func (p *proxyServer) recordReportResult(err error, elapsed time.Duration, token string) {
+	if err != nil {
+		message := safeReportError(err, token)
+		p.reportError.Store(&message)
+		if !p.reportFailing || time.Since(p.lastReportLog) >= time.Minute {
+			log.Printf("[report] failed after %s: %s", elapsed.Round(time.Millisecond), message)
+			p.lastReportLog = time.Now()
+		}
+		p.reportFailing = true
 		return
 	}
-	p.lastError = err.Error()
+	p.reportError.Store(nil)
+	if p.reportFailing {
+		log.Printf("[report] recovered in %s", elapsed.Round(time.Millisecond))
+	}
+	p.reportFailing = false
+}
+
+func (p *proxyServer) setLastError(err error) {
+	if err == nil {
+		p.lastError.Store(nil)
+		return
+	}
+	message := safeReportError(err, p.token)
+	p.lastError.Store(&message)
 }
 
 func (p *proxyServer) lastErrorValue() string {
-	p.lastMu.Lock()
-	defer p.lastMu.Unlock()
-	return p.lastError
+	if value := p.reportError.Load(); value != nil {
+		return *value
+	}
+	if value := p.lastError.Load(); value != nil {
+		return *value
+	}
+	return ""
 }
 
 func parseBasicAuth(value string) (string, string, bool) {

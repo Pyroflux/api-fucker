@@ -349,7 +349,7 @@ func (h *Handler) proxies(w http.ResponseWriter, r *http.Request) {
 		}
 		stats["connections"] += node.CurrentConnections
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": nodes, "stats": stats})
+	writeJSON(w, http.StatusOK, map[string]any{"items": nodes, "stats": stats, "persistence": h.store.PersistenceHealth()})
 }
 
 func (h *Handler) proxyByID(w http.ResponseWriter, r *http.Request) {
@@ -385,7 +385,7 @@ func (h *Handler) proxyReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var report store.ProxyNodeReport
-	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&report); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
