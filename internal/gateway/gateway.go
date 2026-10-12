@@ -48,6 +48,7 @@ type Gateway struct {
 	lastKeyID       string
 	lastMinuteSweep time.Time
 	proxyRoundRobin int
+	manualProxies   manualProxyState
 	inflight        map[string]int
 	activeRequests  int
 	proxyInflight   map[string]int
@@ -563,10 +564,7 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		return selectedKey{}, errUpstreamNotConfigured
 	}
 
-	proxyURL := strings.TrimSpace(cfg.DefaultProxyURL)
-	if strings.TrimSpace(key.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(key.ProxyURL)
-	}
+	proxyURL := ""
 	proxyNodeID := ""
 	if cfg.ProxyPoolEnabled {
 		node, err := g.selectProxyNodeLocked(key.ID, cfg.ProxyMode, proxyNodes)
@@ -577,6 +575,13 @@ func (g *Gateway) acquireKey() (selectedKey, error) {
 		proxyURL = proxyURLWithToken(node.ProxyURL, g.proxyNodeToken)
 		proxyNodeID = node.ID
 		g.proxyInflight[node.ID]++
+	} else {
+		var err error
+		proxyURL, err = g.manualProxyForKeyLocked(key, cfg)
+		if err != nil {
+			g.inflight[key.ID]--
+			return selectedKey{}, err
+		}
 	}
 
 	// Count logical admissions even when the configured RPM limit is disabled.
@@ -710,7 +715,7 @@ func (g *Gateway) forward(ctx context.Context, selected selectedKey, method stri
 }
 
 func (g *Gateway) ListModelsForKey(ctx context.Context, key store.Key, cfg store.GlobalConfig) (ModelListResult, error) {
-	selected, err := selectedForKey(key, cfg)
+	selected, err := g.selectedForKey(key, cfg)
 	if err != nil {
 		return ModelListResult{}, err
 	}
@@ -736,11 +741,6 @@ func (g *Gateway) TestKey(ctx context.Context, key store.Key, cfg store.GlobalCo
 
 func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg store.GlobalConfig, model string, prompt string, progress func(TestProgressEvent)) (UpstreamTestResult, error) {
 	emitProgress(progress, TestProgressEvent{Step: "prepare", Message: "准备测试请求"})
-	selected, err := selectedForKey(key, cfg)
-	if err != nil {
-		emitProgress(progress, TestProgressEvent{Step: "error", Message: "配置不可用", Error: err.Error()})
-		return UpstreamTestResult{}, err
-	}
 	model = strings.TrimSpace(model)
 	if model == "" {
 		emitProgress(progress, TestProgressEvent{Step: "error", Message: "模型不能为空", Error: "model is required"})
@@ -758,6 +758,11 @@ func (g *Gateway) TestKeyWithProgress(ctx context.Context, key store.Key, cfg st
 	})
 	if err != nil {
 		emitProgress(progress, TestProgressEvent{Step: "error", Message: "构建请求失败", Error: err.Error()})
+		return UpstreamTestResult{}, err
+	}
+	selected, err := g.selectedForKey(key, cfg)
+	if err != nil {
+		emitProgress(progress, TestProgressEvent{Step: "error", Message: "配置不可用", Error: err.Error()})
 		return UpstreamTestResult{}, err
 	}
 	captureProgress := newCaptureProgressRecorder(progress)
@@ -1029,7 +1034,7 @@ func traceProgress(progress func(TestProgressEvent), attempt int, proxyURL strin
 	}
 }
 
-func selectedForKey(key store.Key, cfg store.GlobalConfig) (selectedKey, error) {
+func (g *Gateway) selectedForKey(key store.Key, cfg store.GlobalConfig) (selectedKey, error) {
 	baseURL := strings.TrimSpace(cfg.UpstreamBaseURL)
 	if strings.TrimSpace(key.BaseURL) != "" {
 		baseURL = strings.TrimSpace(key.BaseURL)
@@ -1037,9 +1042,12 @@ func selectedForKey(key store.Key, cfg store.GlobalConfig) (selectedKey, error) 
 	if baseURL == "" {
 		return selectedKey{}, errUpstreamNotConfigured
 	}
-	proxyURL := strings.TrimSpace(cfg.DefaultProxyURL)
-	if strings.TrimSpace(key.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(key.ProxyURL)
+	// Admin tests/model fetching retain their existing bypass of the VPS pool.
+	g.mu.Lock()
+	proxyURL, err := g.manualProxyForKeyLocked(key, cfg)
+	g.mu.Unlock()
+	if err != nil {
+		return selectedKey{}, err
 	}
 	return selectedKey{key: key, baseURL: baseURL, proxyURL: proxyURL}, nil
 }

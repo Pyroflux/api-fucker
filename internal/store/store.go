@@ -58,7 +58,15 @@ type GlobalConfig struct {
 	KeyAutoPauseEnabled     bool      `json:"keyAutoPauseEnabled"`
 	KeyAutoPauseThreshold   int       `json:"keyAutoPauseThreshold"`
 	UpdatedAt               time.Time `json:"updatedAt"`
+
+	// Assigned by this Store when a snapshot becomes visible. Never persisted
+	// or accepted from the admin API; wall-clock timestamps are not revisions.
+	revision uint64
 }
+
+// RuntimeRevision orders immutable snapshots from the same Store instance.
+// Zero identifies a config constructed directly rather than read from a Store.
+func (cfg GlobalConfig) RuntimeRevision() uint64 { return cfg.revision }
 
 type Key struct {
 	ID                string    `json:"id"`
@@ -284,9 +292,11 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 	if err := validateRequiredURL(cfg.UpstreamBaseURL, "upstream base URL"); err != nil {
 		return err
 	}
-	if err := validateOptionalURL(cfg.DefaultProxyURL, "default proxy URL"); err != nil {
+	proxyURLs, err := ParseDefaultProxyURLs(cfg.DefaultProxyURL)
+	if err != nil {
 		return err
 	}
+	cfg.DefaultProxyURL = strings.Join(proxyURLs, "\n")
 	if cfg.GlobalMaxConcurrency < 0 {
 		return fmt.Errorf("global max concurrency cannot be negative")
 	}
@@ -311,8 +321,9 @@ func (s *Store) SaveGlobalConfig(cfg GlobalConfig) error {
 		s.mu.Unlock()
 		return ErrClosed
 	}
+	cfg.revision = s.nextRevisionLocked()
 	s.config = cloneConfig(cfg)
-	s.dirtyConfig = s.nextRevisionLocked()
+	s.dirtyConfig = cfg.revision
 	s.mu.Unlock()
 	return s.Flush()
 }

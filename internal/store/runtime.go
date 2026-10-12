@@ -76,6 +76,7 @@ func (s *Store) loadRuntime() error {
 			return err
 		}
 		s.config = normalizeGlobalConfig(s.config)
+		s.config.revision = s.nextRevisionLocked()
 		if err := tx.Bucket([]byte(keysBucket)).ForEach(func(id, raw []byte) error {
 			var key Key
 			if err := json.Unmarshal(raw, &key); err != nil {

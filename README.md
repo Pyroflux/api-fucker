@@ -91,9 +91,9 @@ docker buildx build --platform linux/amd64 -t pyroflux/api-fucker:latest .
 | Setting | Description |
 | --- | --- |
 | Default upstream base URL | Upstream base URL used when a key does not override it. Example: `https://integrate.api.nvidia.com`. |
-| Default proxy URL | Optional HTTP proxy used when a key does not override it. Supports proxy auth in the URL. |
+| Default proxy URLs | Optional HTTP/HTTPS proxies, one URL per line, used when a key does not override them. Supports proxy auth in each URL. Blank lines and duplicate addresses are removed, preserving order. |
 | VPS proxy pool | When enabled, all API traffic uses online enabled VPS proxy nodes instead of key/global proxy settings. |
-| Proxy mode | `round_robin` rotates online proxy nodes; `key_binding` keeps each upstream API key on a stable node when possible. |
+| Proxy mode | Applies to both VPS nodes and the global manual proxy list: `round_robin` rotates proxies; `key_binding` maps each Key ID to a proxy using a stable hash. |
 | Key auto-pause | Enabled by default with a threshold of 3 consecutive failures. It can be disabled or configured with a positive failure threshold. Balance-depleted keys are still paused immediately. |
 | HTTP 429 cooldown | Defaults to 1 consecutive 429 and a 10-minute cooldown; both are configurable. HTTP 429 triggers only temporary rate limiting, not consecutive-failure auto-pause or balance-depleted detection. |
 | Per-key requests per minute | Limits logical request admissions in a rolling 60-second window; 0 disables the limit. Counts remain available in the key list and Details even when the limit is disabled. |
@@ -101,6 +101,14 @@ docker buildx build --platform linux/amd64 -t pyroflux/api-fucker:latest .
 | Request IP blocklist | Optional list of IP patterns denied from accessing `/v1/*`. Blocklist wins over allowlist. |
 
 The Details view shows a snapshot of the key's recent 60-second request count, including admitted requests that later fail. Internal retries do not add to the count, and admin tests/model fetching do not participate in it. Counts are held in memory for this gateway process, reset on restart, and never reconstructed from historical captures. Opening Details for a key without a capture still shows its current count.
+
+For manual proxies, enter one complete URL per line in **默认代理地址（每行一个）**. The config API keeps the existing `defaultProxyUrl` string field, now allowing newline-separated URLs; existing single-URL configurations still work. A bad line rejects the entire save and reports its line number without exposing credentials. To clear the list, save an empty string.
+
+Normal forwarding prioritizes the enabled VPS pool, then a per-key proxy override, then this manual list; without any of these it uses the existing direct/default transport behavior. An enabled VPS pool with no eligible nodes still returns an error instead of falling back to manual proxies. Manual proxy URLs retain their own authentication and do not receive the VPS node token or require heartbeats.
+
+Manual round-robin advances once per new request that uses the global list, in input order. Internal retries and in-flight requests keep their selected proxy. Changing the list or mode resets the manual cursor; changing the list may also change Key bindings. Admin Key tests and model fetching share manual selection and the HTTP client cache, while continuing to bypass the VPS pool as before. Manual proxies have no automatic health checking, eviction, or failover.
+
+Proxy selection caches use an in-memory config revision. Unrelated settings changes preserve the rotation, and late requests holding older config snapshots cannot roll back an activated list or mode: if they have not selected a proxy yet, they join the active rotation. Already selected requests and retries remain on their original proxy. The revision is excluded from the config API and database format.
 
 IP rules support exact and wildcard-prefix matching:
 

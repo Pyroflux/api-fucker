@@ -858,8 +858,10 @@
           <label class="span-2">默认中转站地址
             <input id="upstreamBaseUrl" placeholder="https://api.example.com">
           </label>
-          <label class="span-2">默认代理地址
-            <input id="defaultProxyUrl" placeholder="http://127.0.0.1:7890">
+          <label class="span-2">默认代理地址（每行一个）
+            <textarea id="defaultProxyUrl" rows="4" placeholder="http://127.0.0.1:7890&#10;http://用户名:密码@代理主机:端口"></textarea>
+            <small class="muted">每行一个 http:// 或 https:// 地址，空行和重复地址会自动去除；留空表示不设置全局代理。</small>
+            <small class="muted">按下方“代理模式”轮询或绑定 Key。正式请求优先使用已启用的 VPS 代理池，其次是单 Key 代理覆盖，再使用此列表。</small>
           </label>
           <label>VPS 代理池
             <select id="proxyPoolEnabled">
@@ -1340,7 +1342,7 @@
           method: "PUT",
           body: JSON.stringify({
             upstreamBaseUrl: value("upstreamBaseUrl"),
-            defaultProxyUrl: value("defaultProxyUrl"),
+            defaultProxyUrl: el("defaultProxyUrl").value,
             proxyPoolEnabled: value("proxyPoolEnabled") === "true",
             proxyMode: value("proxyMode") || "round_robin",
             globalMaxConcurrency: Number(value("globalMaxConcurrency") || "0"),
